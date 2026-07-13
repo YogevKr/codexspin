@@ -55,6 +55,7 @@ class AppServerClient:
         self._responses: dict[int, dict] = {}
         self._response_cv = threading.Condition()
         self.notification_handler: Callable[[dict], None] | None = None
+        self.on_close: Callable[[], None] | None = None
         self.stderr_tail: list[str] = []
         self.closed = False
 
@@ -141,6 +142,8 @@ class AppServerClient:
         self.closed = True
         with self._response_cv:
             self._response_cv.notify_all()
+        if self.on_close:
+            self.on_close()
 
     def _read_stderr(self) -> None:
         assert self.proc.stderr is not None

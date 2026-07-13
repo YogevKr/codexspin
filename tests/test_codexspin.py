@@ -154,3 +154,62 @@ def test_job_id_prefix_resolution(capsys):
     assert jobs.resolve_job_id("uniqueprefix") == job_id
     with pytest.raises(SystemExit, match="no job matches"):
         jobs.resolve_job_id("nonexistent")
+
+
+def test_appserver_death_midturn_fails_job(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "die")
+    job_id = spawn(capsys)
+    state = wait_terminal(job_id)
+    assert state["phase"] == "failed"
+    result = json.loads((jobs.job_dir(job_id) / "result.json").read_text())
+    assert "exited unexpectedly" in result["error"]["message"]
+
+
+def test_willretry_error_then_success_is_done(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "retryerr")
+    job_id = spawn(capsys)
+    state = wait_terminal(job_id)
+    assert state["phase"] == "done"
+    rc = cli.main(["result", job_id])
+    assert rc == 0
+    assert "FAKE-DONE" in capsys.readouterr().out
+
+
+def test_cancel_during_startup(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "hang")
+    monkeypatch.setenv("CODEXSPIN_STARTUP_TIMEOUT", "60")
+    job_id = spawn(capsys)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if (jobs.load_state(job_id) or {}).get("activity") == "starting app-server":
+            break
+        time.sleep(0.1)
+    rc = cli.main(["cancel", job_id])
+    assert rc == 0
+    state = wait_terminal(job_id)
+    assert state["phase"] == "cancelled"
+    # runner must actually be gone, not grinding toward the startup timeout
+    time.sleep(0.5)
+    assert not jobs.pid_is_runner(state.get("runner_pid"))
+
+
+def test_send_invalidates_previous_result(capsys, monkeypatch):
+    job_id = spawn(capsys)
+    wait_terminal(job_id)
+    monkeypatch.setenv("FAKE_MODE", "slow")
+    cli.main(["send", job_id, "again"])
+    capsys.readouterr()
+    rc = cli.main(["result", job_id])
+    assert rc == 3  # no stale result served mid-turn
+    cli.main(["cancel", job_id])
+    wait_terminal(job_id)
+
+
+def test_result_json_exit_code_on_failure(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "fail")
+    job_id = spawn(capsys)
+    wait_terminal(job_id)
+    rc = cli.main(["result", job_id, "--json"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert json.loads(out)["phase"] == "failed"

@@ -71,8 +71,14 @@ class Runner:
             elif item.get("type") == "commandExecution":
                 self.command_count += 1
         elif method == "error":
-            self.turn_error = params.get("error")
-            self.set_state(activity=f"error: {str((self.turn_error or {}).get('message', ''))[:200]}")
+            error = params.get("error") or {}
+            # codex 0.144 puts willRetry at params level, next to the error;
+            # accept the nested spot too in case the shape moves.
+            if params.get("willRetry") or error.get("willRetry"):
+                self.set_state(activity=f"transient error, retrying: {str(error.get('message', ''))[:150]}")
+            else:
+                self.turn_error = error
+                self.set_state(activity=f"error: {str(error.get('message', ''))[:200]}")
         elif method == "turn/completed":
             self.final_turn = params.get("turn") or {}
             self.turn_done.set()
@@ -102,7 +108,20 @@ class Runner:
                 self.client.request("turn/interrupt", {"threadId": self.thread_id, "turnId": self.turn_id}, timeout=10)
             except AppServerError as exc:
                 self.logline(f"turn/interrupt failed: {exc}")
+        elif self.client:
+            # Still starting up: no turn to interrupt. Kill the app-server so
+            # the pending request aborts instead of continuing toward a turn
+            # nobody wants (and that cancel already reported as cancelled).
+            self.client.close()
         self.turn_done.set()
+
+    def handle_client_close(self) -> None:
+        if not self.turn_done.is_set():
+            stderr = "\n".join(self.client.stderr_tail[-10:]) if self.client else ""
+            if not self.cancelled and not self.turn_error:
+                self.turn_error = {"message": "app-server exited unexpectedly", "stderr": stderr}
+            self.logline("app-server closed before turn completion")
+            self.turn_done.set()
 
     def run(self) -> int:
         signal.signal(signal.SIGTERM, self.handle_sigterm)
@@ -111,6 +130,7 @@ class Runner:
             self.set_state(phase="starting", activity="starting app-server", runner_pid=os.getpid())
             self.client = AppServerClient(cwd=spec["cwd"])
             self.client.notification_handler = self.on_notification
+            self.client.on_close = self.handle_client_close
             self.client.initialize()
 
             thread_params = {
@@ -141,6 +161,9 @@ class Runner:
 
             self.turn_done.wait()
         except AppServerError as exc:
+            if self.cancelled:
+                self.finish("cancelled")
+                return 0
             stderr = "\n".join(self.client.stderr_tail[-10:]) if self.client else ""
             self.logline(f"failed: {exc}\n{stderr}")
             self.finish("failed", error={"message": str(exc), "stderr": stderr})
@@ -152,12 +175,14 @@ class Runner:
         if self.cancelled:
             self.finish("cancelled")
             return 0
+        # The turn's own terminal status is authoritative: error notifications
+        # that codex recovered from must not fail a completed turn.
         status = self.final_turn.get("status")
-        error = self.turn_error or self.final_turn.get("error")
-        if status == "completed" and not error:
+        if status == "completed" and not self.final_turn.get("error"):
             self.finish("done")
             return 0
-        self.finish("failed", error=error or {"message": f"turn status: {status}"})
+        error = self.final_turn.get("error") or self.turn_error or {"message": f"turn status: {status}"}
+        self.finish("failed", error=error)
         return 1
 
     def finish(self, phase: str, error: dict | None = None) -> None:

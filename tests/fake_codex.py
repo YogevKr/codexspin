@@ -2,10 +2,12 @@
 """Fake `codex app-server` speaking the verified protocol on stdio.
 
 Selected behavior via FAKE_MODE env var:
-  ok    (default) one command item + agentMessage "FAKE-DONE", turn completes
-  fail  turn completes with status=failed and an error notification
-  slow  waits ~20s before completing; turn/interrupt short-circuits it
-  hang  never answers thread/start
+  ok       (default) one command item + agentMessage "FAKE-DONE", turn completes
+  fail     turn completes with status=failed and an error notification
+  slow     waits ~20s before completing; turn/interrupt short-circuits it
+  hang     never answers thread/start
+  die      answers turn/start, then the whole server exits mid-turn
+  retryerr emits a willRetry error notification, then completes normally
 """
 import json
 import os
@@ -29,6 +31,11 @@ def notify(method, params):
 
 def run_turn():
     notify("turn/started", {"threadId": THREAD_ID, "turn": {"id": TURN_ID, "status": "inProgress"}})
+    if MODE == "die":
+        os._exit(1)
+    if MODE == "retryerr":
+        # real 0.144 shape: willRetry sits at params level, next to the error
+        notify("error", {"error": {"message": "transient stream error"}, "willRetry": True})
     if MODE == "slow":
         if interrupted.wait(timeout=20):
             notify("turn/completed", {"threadId": THREAD_ID,

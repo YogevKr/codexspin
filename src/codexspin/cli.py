@@ -24,6 +24,7 @@ from pathlib import Path
 
 from .jobs import (
     SANDBOX_MODES,
+    pid_is_runner,
     TERMINAL_PHASES,
     fmt_elapsed,
     job_dir,
@@ -140,7 +141,7 @@ def cmd_result(args) -> int:
         return 3
     if args.json:
         print(json.dumps(result, indent=2))
-        return 0
+        return 0 if result["phase"] == "done" else 1
     print(f"# {job_id} — {result['phase']}")
     if result.get("duration_ms"):
         print(f"duration: {fmt_elapsed(result['duration_ms'] / 1000)}  commands: {result.get('command_count', 0)}")
@@ -189,7 +190,11 @@ def cmd_send(args) -> int:
     spec = read_json(jd / "job.json") or {}
     spec["prompt"] = args.prompt
     write_json(jd / "job.json", spec)
-    state.update(phase="starting", activity="resuming thread", started_at=time.time())
+    # Invalidate the previous turn's result so `result` reports "no result
+    # yet" during the new turn; history stays in results.jsonl.
+    (jd / "result.json").unlink(missing_ok=True)
+    state.update(phase="starting", activity="resuming thread",
+                 prompt_preview=" ".join(args.prompt.split())[:120], started_at=time.time())
     state.pop("finished_at", None)
     write_json(jd / "state.json", state)
     pid = launch_runner(jd, resume=True)
@@ -205,6 +210,11 @@ def cmd_cancel(args) -> int:
     pid = state.get("runner_pid")
     if state.get("phase") in TERMINAL_PHASES or not pid:
         print(f"codexspin: {job_id} is not running (phase: {state.get('phase', 'unknown')})")
+        return 0
+    if not pid_is_runner(pid):
+        state.update(phase="died", activity="runner gone before cancel", finished_at=time.time())
+        write_json(job_dir(job_id) / "state.json", state)
+        print(f"codexspin: {job_id} runner already gone; marked died")
         return 0
     try:
         if args.hard:

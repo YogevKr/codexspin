@@ -15,6 +15,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import string
 import time
 from pathlib import Path
@@ -40,7 +41,9 @@ def job_dir(job_id: str) -> Path:
 
 
 def write_json(path: Path, data: dict) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # Writer-unique tmp name: the CLI and a detached runner may write the same
+    # state file concurrently, and a shared tmp path races on the rename.
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
 
@@ -62,6 +65,27 @@ def pid_alive(pid: int | None) -> bool:
     return True
 
 
+def pid_is_runner(pid: int | None) -> bool:
+    """True only if pid is alive AND is actually a codexspin runner — guards
+    against PID reuse making a dead job look alive (or getting signalled)."""
+    if not pid_alive(pid):
+        return False
+    cmdline = Path(f"/proc/{pid}/cmdline")
+    if cmdline.exists():
+        try:
+            return b"codexspin" in cmdline.read_bytes()
+        except OSError:
+            return True  # alive but unreadable; don't misreport as died
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=5)
+    except (subprocess.SubprocessError, OSError):
+        return True  # alive but unverifiable; don't misreport as died
+    if out.returncode != 0 or not out.stdout.strip():
+        return True  # ps lacks -p/-o (e.g. BusyBox); trust liveness
+    return "codexspin.runner" in out.stdout
+
+
 def load_state(job_id: str) -> dict | None:
     state = read_json(job_dir(job_id) / "state.json")
     if state is None:
@@ -70,7 +94,7 @@ def load_state(job_id: str) -> dict | None:
     # behind; surface that as its own phase instead of pretending it works.
     # Grace period: right after spawn the runner may not have written its pid yet.
     launching = not state.get("runner_pid") and time.time() - (state.get("started_at") or 0) < 10
-    if state.get("phase") not in TERMINAL_PHASES and not launching and not pid_alive(state.get("runner_pid")):
+    if state.get("phase") not in TERMINAL_PHASES and not launching and not pid_is_runner(state.get("runner_pid")):
         state["phase"] = "died"
     return state
 
