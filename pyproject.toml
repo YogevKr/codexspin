@@ -1,0 +1,22 @@
+[project]
+name = "codexspin"
+version = "0.1.0"
+description = "Spin and manage parallel Codex sessions via the codex app-server: spawn / status / result / await / send / cancel, with all three sandbox modes."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+codexspin = "codexspin.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codexspin"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
