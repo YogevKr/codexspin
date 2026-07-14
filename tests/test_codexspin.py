@@ -10,14 +10,19 @@ import pytest
 from codexspin import cli, jobs
 
 FAKE = str(Path(__file__).parent / "fake_codex.py")
+FAKE_SSH = str(Path(__file__).parent / "fake_ssh.py")
 
 
 @pytest.fixture(autouse=True)
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEXSPIN_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("CODEXSPIN_CODEX_BIN", FAKE)
+    monkeypatch.setenv("CODEXSPIN_SSH_BIN", FAKE_SSH)
+    monkeypatch.setenv("FAKE_SSH_REMOTE_HOME", str(tmp_path / "remote-home"))
     monkeypatch.setenv("CODEXSPIN_STARTUP_TIMEOUT", "5")
     monkeypatch.setenv("FAKE_MODE", "ok")
+    monkeypatch.delenv("FAKE_SSH_ARGV_FILE", raising=False)
+    monkeypatch.delenv("FAKE_SSH_MISSING_CODEXSPIN", raising=False)
     monkeypatch.chdir(tmp_path)
     yield
 
@@ -36,6 +41,97 @@ def wait_terminal(job_id: str, timeout: float = 15) -> dict:
             return state
         time.sleep(0.1)
     raise AssertionError(f"job {job_id} never reached a terminal phase: {jobs.load_state(job_id)}")
+
+
+def wait_remote_terminal(remote_home: Path, job_id: str, timeout: float = 15) -> dict:
+    state_path = remote_home / "jobs" / job_id / "state.json"
+    deadline = time.time() + timeout
+    state = None
+    while time.time() < deadline:
+        state = jobs.read_json(state_path)
+        if state and state.get("phase") in jobs.TERMINAL_PHASES:
+            return state
+        time.sleep(0.1)
+    raise AssertionError(f"remote job {job_id} never reached a terminal phase: {state}")
+
+
+def test_remote_spawn_status_and_prompt_round_trip(capfd, monkeypatch, tmp_path):
+    remote_home = Path(os.environ["FAKE_SSH_REMOTE_HOME"])
+    remote_cwd = tmp_path / "remote cwd"
+    remote_cwd.mkdir()
+    argv_file = tmp_path / "ssh-argv.json"
+    monkeypatch.setenv("FAKE_SSH_ARGV_FILE", str(argv_file))
+    prompt = 'Keep "double quotes", single quotes, and $variables.\nSecond line: `literal`.'
+
+    rc = cli.main([
+        "spawn", "-n", "remote", "--host", "testbox", "-C", str(remote_cwd), prompt,
+    ])
+    out = capfd.readouterr().out
+    assert rc == 0
+    job_id = out.strip().splitlines()[-1]
+    assert job_id.startswith("remote-")
+    assert json.loads(argv_file.read_text()) == [
+        "testbox", "codexspin", "spawn", "-n", "remote", "-C", str(remote_cwd), "-",
+    ]
+    assert not (Path(os.environ["CODEXSPIN_HOME"]) / "jobs" / job_id).exists()
+
+    state = wait_remote_terminal(remote_home, job_id)
+    assert state["phase"] == "done"
+    spec_path = remote_home / "jobs" / job_id / "job.json"
+    spec = json.loads(spec_path.read_text())
+    assert spec["prompt"] == prompt
+    assert spec["cwd"] == str(remote_cwd)
+
+    rc = cli.main(["status", "--host", "testbox", job_id])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert job_id in out
+
+    follow_up = 'Now preserve "this" too.\nAnd this apostrophe: it\'s exact.'
+    rc = cli.main(["send", job_id, follow_up, "--host", "testbox"])
+    assert rc == 0
+    capfd.readouterr()
+    assert json.loads(argv_file.read_text()) == [
+        "testbox", "codexspin", "send", job_id, "-",
+    ]
+    wait_remote_terminal(remote_home, job_id)
+    assert json.loads(spec_path.read_text())["prompt"] == follow_up
+
+
+def test_remote_result_preserves_failed_exit_code(capfd, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "fail")
+    remote_home = Path(os.environ["FAKE_SSH_REMOTE_HOME"])
+
+    rc = cli.main(["spawn", "--host", "testbox", "fail remotely"])
+    job_id = capfd.readouterr().out.strip().splitlines()[-1]
+    assert rc == 0
+    assert wait_remote_terminal(remote_home, job_id)["phase"] == "failed"
+
+    rc = cli.main(["result", "--host", "testbox", job_id])
+    captured = capfd.readouterr()
+    assert rc == 1
+    assert "fake model exploded" in captured.out
+    assert "remote codexspin not found" not in captured.err
+
+
+def test_remote_missing_codexspin_prints_install_hint(capfd, monkeypatch):
+    monkeypatch.setenv("FAKE_SSH_MISSING_CODEXSPIN", "1")
+
+    rc = cli.main(["status", "--host", "testbox"])
+    captured = capfd.readouterr()
+    assert rc == 127
+    assert "codexspin: command not found" in captured.err
+    hints = [line for line in captured.err.splitlines() if "uv tool install codexspin" in line]
+    assert hints == [
+        "codexspin: remote codexspin not found; install it there with: uv tool install codexspin",
+    ]
+
+
+def test_remote_doctor_and_gc(capfd):
+    assert cli.main(["doctor", "--host", "testbox"]) == 0
+    assert "app-server: ok" in capfd.readouterr().out
+    assert cli.main(["gc", "--host", "testbox", "--keep-days", "0"]) == 0
+    assert "removed 0 finished job(s)" in capfd.readouterr().out
 
 
 def test_spawn_completes_and_result(capsys):
