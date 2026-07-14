@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -72,9 +73,12 @@ def test_remote_spawn_status_and_prompt_round_trip(capfd, monkeypatch, tmp_path)
     assert rc == 0
     job_id = out.strip().splitlines()[-1]
     assert job_id.startswith("remote-")
-    assert json.loads(argv_file.read_text()) == [
-        "testbox", "codexspin", "spawn", "-n", "remote", "-C", str(remote_cwd), "-",
-    ]
+    recorded = json.loads(argv_file.read_text())
+    assert recorded[0] == "testbox"
+    # ssh receives ONE shell-quoted command string; split it like a shell would
+    remote_tokens = shlex.split(" ".join(recorded[1:]))
+    remote_tokens = [t for t in remote_tokens if not t.startswith("CODEXSPIN_HOME=")]
+    assert remote_tokens == ["codexspin", "spawn", "-n", "remote", "-C", str(remote_cwd), "-"]
     assert not (Path(os.environ["CODEXSPIN_HOME"]) / "jobs" / job_id).exists()
 
     state = wait_remote_terminal(remote_home, job_id)
@@ -93,9 +97,10 @@ def test_remote_spawn_status_and_prompt_round_trip(capfd, monkeypatch, tmp_path)
     rc = cli.main(["send", job_id, follow_up, "--host", "testbox"])
     assert rc == 0
     capfd.readouterr()
-    assert json.loads(argv_file.read_text()) == [
-        "testbox", "codexspin", "send", job_id, "-",
-    ]
+    recorded = json.loads(argv_file.read_text())
+    remote_tokens = [t for t in shlex.split(" ".join(recorded[1:]))
+                     if not t.startswith("CODEXSPIN_HOME=")]
+    assert remote_tokens == ["codexspin", "send", job_id, "-"]
     wait_remote_terminal(remote_home, job_id)
     assert json.loads(spec_path.read_text())["prompt"] == follow_up
 
@@ -322,7 +327,7 @@ def test_handoff_without_thread_id_is_clear(capsys, tmp_path, monkeypatch):
     state.pop("thread_id")
     state_path.write_text(json.dumps(state))
 
-    with pytest.raises(SystemExit, match="has no thread_id to hand off"):
+    with pytest.raises(SystemExit, match="has no thread yet"):
         cli.main(["handoff", job_id, "build-host"])
 
 

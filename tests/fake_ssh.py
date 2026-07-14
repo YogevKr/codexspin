@@ -2,13 +2,18 @@
 """Fake ssh: runs the requested codexspin command locally against a second
 CODEXSPIN_HOME to simulate a remote machine.
 
-Supports both test conventions:
-  FAKE_SSH_ARGV_FILE            write last argv (json) here
+Like real OpenSSH, the remote command arrives as argv joined into one string
+that a shell would reparse — this fake shlex-splits it and honors leading
+VAR=value assignments.
+
+Env conventions:
+  FAKE_SSH_ARGV_FILE            write last raw argv (json) here
   FAKE_SSH_LOG                  append {"host", "command"} json lines here
   FAKE_SSH_MISSING_CODEXSPIN /
   FAKE_SSH_CODEXSPIN_MISSING    simulate codexspin absent on the remote (127)
   FAKE_SSH_REMOTE_HOME /
-  FAKE_REMOTE_CODEXSPIN_HOME    CODEXSPIN_HOME on the "remote"
+  FAKE_REMOTE_CODEXSPIN_HOME    CODEXSPIN_HOME on the "remote" (wins over a
+                                CODEXSPIN_HOME= assignment in the command)
   FAKE_REMOTE_HOME              HOME on the "remote"
   FAKE_REMOTE_MODE              FAKE_MODE on the "remote"
   FAKE_SSH_PYTHON               run via this python -m codexspin.cli instead
@@ -17,9 +22,13 @@ Supports both test conventions:
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def main() -> int:
@@ -27,7 +36,15 @@ def main() -> int:
     if len(argv) < 2:
         print("fake ssh: missing host or command", file=sys.stderr)
         return 2
-    host, command = argv[0], argv[1:]
+    host = argv[0]
+    # OpenSSH semantics: everything after the host is space-joined and
+    # reparsed by the remote shell.
+    command = shlex.split(" ".join(argv[1:]))
+
+    env = os.environ.copy()
+    while command and _ASSIGNMENT.match(command[0]):
+        key, value = command.pop(0).split("=", 1)
+        env[key] = value
 
     record = os.environ.get("FAKE_SSH_ARGV_FILE")
     if record:
@@ -40,11 +57,10 @@ def main() -> int:
     if os.environ.get("FAKE_SSH_MISSING_CODEXSPIN") or os.environ.get("FAKE_SSH_CODEXSPIN_MISSING"):
         print("sh: codexspin: command not found", file=sys.stderr)
         return 127
-    if command[0] != "codexspin":
+    if not command or command[0] != "codexspin":
         print(f"fake ssh: unsupported command: {' '.join(command)}", file=sys.stderr)
         return 2
 
-    env = os.environ.copy()
     remote_home = os.environ.get("FAKE_REMOTE_CODEXSPIN_HOME") or os.environ.get("FAKE_SSH_REMOTE_HOME")
     if remote_home:
         env["CODEXSPIN_HOME"] = remote_home

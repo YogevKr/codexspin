@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import shlex
 import json
 import os
 import shutil
@@ -102,7 +103,7 @@ def _run_remote(args, argv: list[str]) -> int:
 
     forwarded = _forwarded_argv(argv, prompt_index)
     ssh_bin = os.environ.get("CODEXSPIN_SSH_BIN", "ssh")
-    command = [ssh_bin, str(args.remote_host), "codexspin", *forwarded]
+    command = [ssh_bin, str(args.remote_host), _remote_command(["codexspin", *forwarded])]
     try:
         if prompt is None:
             completed = subprocess.run(command)
@@ -114,6 +115,18 @@ def _run_remote(args, argv: list[str]) -> int:
     if completed.returncode == 127:
         print(_REMOTE_INSTALL_HINT, file=sys.stderr)
     return completed.returncode
+
+
+def _remote_command(parts: list[str]) -> str:
+    """One shell-quoted command string for ssh: OpenSSH joins argv with spaces
+    and lets the remote shell reparse, so every token must be quoted. When the
+    local job root is overridden, the remote must use the same root — the
+    rsynced paths assume it."""
+    command = shlex.join(parts)
+    home = os.environ.get("CODEXSPIN_HOME")
+    if home:
+        command = f"CODEXSPIN_HOME={shlex.quote(home)} {command}"
+    return command
 
 
 def _add_host_argument(parser: argparse.ArgumentParser) -> None:
@@ -477,9 +490,21 @@ def command_error(prefix: str, result: subprocess.CompletedProcess) -> SystemExi
 
 def cmd_handoff(args) -> int:
     job_id = resolve_job_id(args.job)
+    with open(job_dir(job_id) / "cli.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _handoff_locked(args, job_id)
+
+
+def _handoff_locked(args, job_id: str) -> int:
     state = load_state(job_id)
     if state is None:
         raise SystemExit(f"codexspin: cannot read state for {job_id}")
+
+    # A job that has not recorded a thread yet cannot be resumed anywhere;
+    # cancelling it first would just destroy it with nothing to hand off.
+    if not state.get("thread_id"):
+        raise SystemExit(f"codexspin: {job_id} has no thread yet ({state.get('phase', '?')}); "
+                         "wait for it to start or cancel it yourself")
 
     if state.get("phase") not in TERMINAL_PHASES:
         cmd_cancel(argparse.Namespace(job=job_id, hard=False))
@@ -515,21 +540,29 @@ def cmd_handoff(args) -> int:
 
     ssh_bin = os.environ.get("CODEXSPIN_SSH_BIN", "ssh")
     rsync_bin = os.environ.get("CODEXSPIN_RSYNC_BIN", "rsync")
-    probe = run_handoff_command([ssh_bin, args.host, "codexspin", "--help"])
+    probe = run_handoff_command([ssh_bin, args.host, _remote_command(["codexspin", "--help"])])
     if probe.returncode != 0:
         if remote_codexspin_missing(probe):
             raise remote_install_error(args.host)
         raise command_error(f"could not reach codexspin on {args.host}", probe)
 
-    for source in (cwd_tree, rollout, job_dir(job_id).resolve()):
+    sources = [cwd_tree, rollout, job_dir(job_id).resolve()]
+    # A linked worktree's .git file points into the main repo's git dir;
+    # without it the remote tree is not a repository.
+    common_dir = spec.get("git_common_dir")
+    if spec.get("worktree") and common_dir and os.path.isdir(common_dir):
+        sources.append(Path(common_dir))
+    for source in sources:
         copied = run_handoff_command([
-            rsync_bin, "--archive", "--relative", "--", str(source), f"{args.host}:/",
+            rsync_bin, "--archive", "--relative", "--rsh", ssh_bin,
+            "--", str(source), f"{args.host}:/",
         ])
         if copied.returncode != 0:
             raise command_error(f"rsync failed for {source}", copied)
 
     resumed = run_handoff_command(
-        [ssh_bin, args.host, "codexspin", "send", job_id, "-"], input_text=prompt,
+        [ssh_bin, args.host, _remote_command(["codexspin", "send", job_id, "-"])],
+        input_text=prompt,
     )
     if resumed.returncode != 0:
         if remote_codexspin_missing(resumed):
@@ -677,7 +710,7 @@ def cmd_doctor(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    parser = argparse.ArgumentParser(prog="codexspin", description=__doc__,
+    parser = argparse.ArgumentParser(prog="codexspin", description=__doc__, allow_abbrev=False,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
