@@ -491,6 +491,31 @@ def test_worktree_spawn_and_gc(capsys, tmp_path):
     assert f"codexspin/{job_id}" in branches  # committed work survives on the branch
 
 
+def test_worktree_job_gets_git_writable_root(capsys, tmp_path, monkeypatch):
+    repo = make_repo(tmp_path / "repo")
+    argv_file = tmp_path / "codex-argv.json"
+    monkeypatch.setenv("FAKE_CODEX_ARGV_FILE", str(argv_file))
+    rc = cli.main(["spawn", "-w", "-C", str(repo), "-n", "gitroot", "do the thing"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    spec = json.loads((jobs.job_dir(job_id) / "job.json").read_text())
+    assert spec["writable_roots"] == [spec["git_common_dir"]]
+    wait_terminal(job_id)
+    argv = json.loads(argv_file.read_text())
+    assert argv[0] == "-c"
+    assert json.loads(argv[1].split("=", 1)[1]) == [spec["git_common_dir"]]
+    assert argv[-1] == "app-server"
+
+
+def test_explicit_writable_root_flag(capsys, tmp_path):
+    extra = tmp_path / "shared"
+    extra.mkdir()
+    job_id = spawn(capsys, "--writable-root", str(extra))
+    spec = json.loads((jobs.job_dir(job_id) / "job.json").read_text())
+    assert spec["writable_roots"] == [str(extra.resolve())]
+    wait_terminal(job_id)
+
+
 def test_worktree_requires_git_repo(tmp_path):
     with pytest.raises(SystemExit, match="requires a git repository"):
         cli.main(["spawn", "-w", "-C", str(tmp_path), "nope"])

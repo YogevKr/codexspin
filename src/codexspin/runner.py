@@ -171,7 +171,13 @@ class Runner:
             deadline_timer.start()
         try:
             self.set_state(phase="starting", activity="starting app-server", runner_pid=os.getpid())
-            self.client = AppServerClient(cwd=spec["cwd"])
+            overrides = []
+            if spec.get("writable_roots"):
+                # Per-job app-server => per-job sandbox roots. Lets codex git-commit
+                # in linked worktrees whose metadata lives outside the tree.
+                overrides.append(
+                    f"sandbox_workspace_write.writable_roots={json.dumps(spec['writable_roots'])}")
+            self.client = AppServerClient(cwd=spec["cwd"], config_overrides=overrides)
             self.client.notification_handler = self.on_notification
             self.client.on_close = self.handle_client_close
             self.client.initialize()

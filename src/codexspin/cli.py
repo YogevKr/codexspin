@@ -203,6 +203,11 @@ def cmd_spawn(args) -> int:
         cwd = os.path.normpath(os.path.join(wt["worktree"], rel))
     jd = job_dir(job_id)
     jd.mkdir(parents=True)
+    writable_roots = list(args.writable_root or [])
+    if wt and sandbox == "workspace-write" and wt.get("git_common_dir"):
+        # Linked-worktree git metadata lives outside the tree; without this
+        # root the job cannot git-commit its own work.
+        writable_roots.append(wt["git_common_dir"])
     write_json(jd / "job.json", {
         "job_id": job_id,
         "prompt": prompt,
@@ -211,6 +216,7 @@ def cmd_spawn(args) -> int:
         "model": args.model,
         "effort": args.effort,
         "max_minutes": args.max_minutes,
+        "writable_roots": [os.path.realpath(r) for r in writable_roots],
         "created_at": time.time(),
         **wt,
     })
@@ -730,6 +736,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="run in a fresh git worktree (branch codexspin/<job-id>)")
     p.add_argument("--max-minutes", type=float, default=None,
                    help="interrupt the job after this many minutes (phase: timeout)")
+    p.add_argument("--writable-root", action="append", metavar="DIR",
+                   help="extra writable dir for the workspace-write sandbox (repeatable)")
     _add_host_argument(p)
     p.set_defaults(fn=cmd_spawn)
 

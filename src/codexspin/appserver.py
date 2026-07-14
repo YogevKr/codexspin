@@ -38,10 +38,12 @@ class AppServerError(Exception):
 class AppServerClient:
     """One spawned `codex app-server` process, one client."""
 
-    def __init__(self, cwd: str, env: dict[str, str] | None = None):
+    def __init__(self, cwd: str, env: dict[str, str] | None = None,
+                 config_overrides: list[str] | None = None):
         codex_bin = os.environ.get("CODEXSPIN_CODEX_BIN", "codex")
+        overrides = [arg for override in (config_overrides or []) for arg in ("-c", override)]
         self.proc = subprocess.Popen(
-            [codex_bin, "app-server"],
+            [codex_bin, *overrides, "app-server"],
             cwd=cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

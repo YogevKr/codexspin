@@ -15,6 +15,10 @@ import sys
 import threading
 
 MODE = os.environ.get("FAKE_MODE", "ok")
+ARGV_FILE = os.environ.get("FAKE_CODEX_ARGV_FILE")
+if ARGV_FILE:
+    with open(ARGV_FILE, "w") as fh:
+        json.dump(sys.argv[1:], fh)
 THREAD_ID = "fake-thread-0001"
 TURN_ID = "fake-turn-0001"
 interrupted = threading.Event()

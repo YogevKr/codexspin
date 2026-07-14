@@ -69,8 +69,11 @@ Job ids accept unambiguous prefixes. Every job records the codex thread id, so
 
 - `-w/--worktree` runs the job in a fresh git worktree
   (`~/.codexspin/worktrees/<job-id>`, branch `codexspin/<job-id>`) so parallel
-  jobs never fight over the tree. `gc` removes only clean worktrees —
-  committed work survives on the branch, uncommitted work keeps the job.
+  jobs never fight over the tree. The worktree's git metadata dir is added to
+  the job's sandbox writable roots (per-job app-server `-c` override), so the
+  job can `git commit` its own work — tell it to. `gc` removes only clean
+  worktrees — committed work survives on the branch, uncommitted work keeps
+  the job. `--writable-root DIR` (repeatable) adds further writable dirs.
 - `--max-minutes N` interrupts a runaway job (phase `timeout`).
 - `status` shows each job's resolved model/effort and the latest ChatGPT
   quota reading (`account/rateLimits/updated` pushed by the app-server).
