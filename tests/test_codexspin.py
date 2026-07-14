@@ -2,6 +2,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -10,6 +11,8 @@ import pytest
 from codexspin import cli, jobs
 
 FAKE = str(Path(__file__).parent / "fake_codex.py")
+FAKE_SSH = str(Path(__file__).parent / "fake_ssh.py")
+FAKE_RSYNC = str(Path(__file__).parent / "fake_rsync.py")
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +39,52 @@ def wait_terminal(job_id: str, timeout: float = 15) -> dict:
             return state
         time.sleep(0.1)
     raise AssertionError(f"job {job_id} never reached a terminal phase: {jobs.load_state(job_id)}")
+
+
+def wait_remote_terminal(remote_home: Path, job_id: str, timeout: float = 15) -> dict:
+    state_path = remote_home / "jobs" / job_id / "state.json"
+    deadline = time.time() + timeout
+    state = None
+    while time.time() < deadline:
+        try:
+            state = json.loads(state_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            time.sleep(0.1)
+            continue
+        if state.get("phase") in jobs.TERMINAL_PHASES:
+            return state
+        time.sleep(0.1)
+    raise AssertionError(f"remote job {job_id} never reached a terminal phase: {state}")
+
+
+def prepare_handoff(tmp_path, monkeypatch, *, create_rollout=True):
+    local_home = tmp_path / "user-home"
+    remote_root = tmp_path / "remote-root"
+    local_codexspin_home = Path(os.environ["CODEXSPIN_HOME"])
+    remote_codexspin_home = remote_root / local_codexspin_home.relative_to("/")
+    remote_home = remote_root / local_home.relative_to("/")
+    rsync_log = tmp_path / "rsync.jsonl"
+
+    monkeypatch.setenv("HOME", str(local_home))
+    monkeypatch.setenv("CODEXSPIN_SSH_BIN", FAKE_SSH)
+    monkeypatch.setenv("CODEXSPIN_RSYNC_BIN", FAKE_RSYNC)
+    monkeypatch.setenv("FAKE_SSH_PYTHON", sys.executable)
+    monkeypatch.setenv("FAKE_REMOTE_CODEXSPIN_HOME", str(remote_codexspin_home))
+    monkeypatch.setenv("FAKE_REMOTE_HOME", str(remote_home))
+    monkeypatch.setenv("FAKE_REMOTE_MODE", "ok")
+    monkeypatch.setenv("FAKE_RSYNC_REMOTE_ROOT", str(remote_root))
+    monkeypatch.setenv("FAKE_RSYNC_LOG", str(rsync_log))
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "work.txt").write_text("warm worktree context\n")
+    rollout = local_home / ".codex" / "sessions" / "2026" / "07" / "14" / (
+        "rollout-2026-07-14T10-00-00-fake-thread-0001.jsonl"
+    )
+    if create_rollout:
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text('{"warm":"context"}\n')
+    return project, rollout, remote_root, remote_codexspin_home, rsync_log
 
 
 def test_spawn_completes_and_result(capsys):
@@ -106,6 +155,107 @@ def test_send_resumes_thread(capsys):
     assert spec["prompt"] == "and another thing"
     history = (jobs.job_dir(job_id) / "results.jsonl").read_text().strip().splitlines()
     assert len(history) == 2
+
+
+def test_handoff_finished_job_resumes_remotely(capsys, tmp_path, monkeypatch):
+    project, rollout, remote_root, remote_home, rsync_log = prepare_handoff(tmp_path, monkeypatch)
+    rc = cli.main(["spawn", "-C", str(project), "-n", "handoff", "do the thing"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    assert wait_terminal(job_id)["phase"] == "done"
+
+    rc = cli.main(["handoff", "handoff", "build-host"])
+    assert rc == 0
+    assert capsys.readouterr().out.strip().splitlines() == [
+        job_id,
+        f"ssh build-host codexspin status {job_id}",
+    ]
+    assert wait_remote_terminal(remote_home, job_id)["phase"] == "done"
+
+    remote_job = remote_home / "jobs" / job_id
+    remote_spec = json.loads((remote_job / "job.json").read_text())
+    assert remote_spec["prompt"] == (
+        "You were handed off to another machine mid-task. "
+        "Re-read your prior context and continue to completion."
+    )
+    assert len((remote_job / "results.jsonl").read_text().strip().splitlines()) == 2
+    assert (remote_root / project.relative_to("/") / "work.txt").read_text() == "warm worktree context\n"
+    assert (remote_root / rollout.relative_to("/")).read_text() == '{"warm":"context"}\n'
+
+    transfers = [json.loads(line) for line in rsync_log.read_text().splitlines()]
+    assert [entry["source"] for entry in transfers] == [
+        str(project), str(rollout), str(jobs.job_dir(job_id)),
+    ]
+    assert all(entry["destination"] == "build-host:/" for entry in transfers)
+    local_state = json.loads((jobs.job_dir(job_id) / "state.json").read_text())
+    assert local_state["phase"] == "done"
+    assert local_state["handed_off_to"] == "build-host"
+    assert jobs.job_dir(job_id).is_dir()
+
+
+def test_handoff_running_job_cancels_before_copy(capsys, tmp_path, monkeypatch):
+    project, _, _, remote_home, _ = prepare_handoff(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_MODE", "slow")
+    rc = cli.main(["spawn", "-C", str(project), "-n", "moving", "keep working"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if (jobs.load_state(job_id) or {}).get("phase") == "running":
+            break
+        time.sleep(0.1)
+    assert (jobs.load_state(job_id) or {}).get("phase") == "running"
+
+    rc = cli.main(["handoff", job_id, "other-host", "finish on the remote"])
+    assert rc == 0
+    capsys.readouterr()
+    local_state = json.loads((jobs.job_dir(job_id) / "state.json").read_text())
+    assert local_state["phase"] == "cancelled"
+    assert local_state["handed_off_to"] == "other-host"
+    assert wait_remote_terminal(remote_home, job_id)["phase"] == "done"
+    remote_spec = json.loads((remote_home / "jobs" / job_id / "job.json").read_text())
+    assert remote_spec["prompt"] == "finish on the remote"
+
+
+def test_handoff_missing_session_file_is_clear(capsys, tmp_path, monkeypatch):
+    project, _, _, remote_home, _ = prepare_handoff(
+        tmp_path, monkeypatch, create_rollout=False,
+    )
+    rc = cli.main(["spawn", "-C", str(project), "-n", "orphan", "do the thing"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    wait_terminal(job_id)
+
+    with pytest.raises(SystemExit, match="no Codex session rollout file found"):
+        cli.main(["handoff", job_id, "build-host"])
+    assert not (remote_home / "jobs" / job_id).exists()
+
+
+def test_handoff_without_thread_id_is_clear(capsys, tmp_path, monkeypatch):
+    project, _, _, _, _ = prepare_handoff(tmp_path, monkeypatch)
+    rc = cli.main(["spawn", "-C", str(project), "-n", "threadless", "do the thing"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    wait_terminal(job_id)
+    state_path = jobs.job_dir(job_id) / "state.json"
+    state = json.loads(state_path.read_text())
+    state.pop("thread_id")
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(SystemExit, match="has no thread_id to hand off"):
+        cli.main(["handoff", job_id, "build-host"])
+
+
+def test_handoff_remote_missing_codexspin_has_install_hint(capsys, tmp_path, monkeypatch):
+    project, _, _, _, _ = prepare_handoff(tmp_path, monkeypatch)
+    rc = cli.main(["spawn", "-C", str(project), "-n", "missing", "do the thing"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    wait_terminal(job_id)
+    monkeypatch.setenv("FAKE_SSH_CODEXSPIN_MISSING", "1")
+
+    with pytest.raises(SystemExit, match="install it there and ensure it is on PATH"):
+        cli.main(["handoff", job_id, "empty-host"])
 
 
 def test_send_refuses_running_job(capsys, monkeypatch):
