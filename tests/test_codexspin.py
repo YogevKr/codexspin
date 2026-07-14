@@ -349,6 +349,22 @@ def test_max_minutes_rejects_zero(tmp_path):
         cli.main(["spawn", "--max-minutes", "0", "nope"])
 
 
+def test_fancy_status_output(capsys, monkeypatch):
+    monkeypatch.setenv("CODEXSPIN_COLOR", "1")
+    job_id = spawn(capsys)
+    wait_terminal(job_id)
+    cli.main(["status", job_id])
+    out = capsys.readouterr().out
+    assert "\033[" in out            # ANSI styling active
+    assert "✓" in out                # done glyph
+    assert "▓" in out                # quota bar
+    monkeypatch.setenv("CODEXSPIN_COLOR", "0")
+    cli.main(["status", job_id])
+    out = capsys.readouterr().out
+    assert "\033[" not in out        # plain when disabled
+    assert "codex quota: 42%" in out
+
+
 def test_quota_window_formatting(capsys):
     job_id = spawn(capsys)
     wait_terminal(job_id)

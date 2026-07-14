@@ -140,6 +140,113 @@ def cmd_spawn(args) -> int:
     return 0
 
 
+def use_color() -> bool:
+    forced = os.environ.get("CODEXSPIN_COLOR")
+    if forced is not None:
+        return forced not in ("0", "false", "no")
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    return sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+
+
+class Style:
+    """ANSI styling that collapses to plain text when color is off."""
+
+    def __init__(self, enabled: bool):
+        self.on = enabled
+
+    def _wrap(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.on else text
+
+    def bold(self, t): return self._wrap("1", t)
+    def dim(self, t): return self._wrap("2", t)
+    def red(self, t): return self._wrap("31", t)
+    def green(self, t): return self._wrap("32", t)
+    def yellow(self, t): return self._wrap("33", t)
+    def cyan(self, t): return self._wrap("36", t)
+    def gray(self, t): return self._wrap("90", t)
+
+
+PHASE_GLYPH = {
+    "starting": ("◌", "cyan"), "running": ("●", "cyan"), "done": ("✓", "green"),
+    "failed": ("✗", "red"), "cancelled": ("■", "gray"), "died": ("☠", "red"),
+    "timeout": ("⏱", "yellow"),
+}
+
+
+def styled_sandbox(st: Style, sandbox: str) -> str:
+    if sandbox == "danger-full-access":
+        return st.red(st.bold("yolo"))
+    if sandbox == "workspace-write":
+        return st.yellow("write")
+    return st.green(sandbox or "?")
+
+
+def quota_line(st: Style, quota: dict, fancy: bool) -> str:
+    mins = quota.get("window_mins") or 0
+    if mins >= 1440:
+        window = f"{round(mins / 1440)}d"
+    elif mins >= 60:
+        window = f"{round(mins / 60)}h"
+    else:
+        window = f"{mins}m"
+    pct = quota.get("used_percent") or 0
+    text = (f"codex quota: {pct}% of {window} window used"
+            f" (plan: {quota.get('plan', '?')})")
+    if not fancy:
+        return text
+    filled = min(10, round(pct / 10))
+    bar = "▓" * filled + "░" * (10 - filled)
+    paint = st.green if pct < 70 else (st.yellow if pct < 90 else st.red)
+    return f"{paint(bar)} {paint(text)}"
+
+
+def print_job_fancy(st: Style, s: dict, width: int) -> None:
+    phase = s.get("phase", "?")
+    glyph, color = PHASE_GLYPH.get(phase, ("?", "gray"))
+    paint = getattr(st, color)
+    started = s.get("started_at") or 0
+    end = s.get("finished_at") or time.time()
+    finished = phase in TERMINAL_PHASES
+    head = (f"{paint(glyph)} {st.bold(s['job_id']):{34 + (8 if st.on else 0)}s} "
+            f"{paint(f'{phase:9s}')} {fmt_elapsed(end - started):>7s}  "
+            f"{styled_sandbox(st, s.get('sandbox', '?'))}")
+    if s.get("model"):
+        model_effort = f"{s['model']}/{s.get('effort', '?')}"
+        head += f"  {st.dim(model_effort)}"
+    print(head)
+    print(f"  {st.dim(s.get('prompt_preview', '')[:width - 4])}")
+    if not finished:
+        print(f"  {st.cyan('↳ ' + str(s.get('activity', ''))[:width - 6])}")
+    meta = []
+    if s.get("branch"):
+        meta.append(f"branch {s['branch']}")
+    if s.get("thread_id"):
+        meta.append(f"resume: codex resume {s['thread_id']}")
+    if meta:
+        print(f"  {st.gray('  '.join(meta))}")
+    print()
+
+
+def print_job_plain(s: dict) -> None:
+    started = s.get("started_at") or 0
+    end = s.get("finished_at") or time.time()
+    line = (
+        f"{s['job_id']:34s} {s.get('phase', '?'):9s} {fmt_elapsed(end - started):>7s}  "
+        f"[{s.get('sandbox', '?')}] {Path(s.get('cwd', '')).name}"
+    )
+    if s.get("model"):
+        line += f"  {s['model']}/{s.get('effort', '?')}"
+    print(line)
+    print(f"  {s.get('prompt_preview', '')}")
+    if s.get("phase") not in TERMINAL_PHASES:
+        print(f"  ↳ {s.get('activity', '')}")
+    if s.get("branch"):
+        print(f"  branch: {s['branch']}  worktree: {s.get('worktree', '')}")
+    if s.get("thread_id"):
+        print(f"  resume: codex resume {s['thread_id']}")
+
+
 def cmd_status(args) -> int:
     if args.job:
         states = [s for s in [load_state(resolve_job_id(args.job))] if s]
@@ -155,37 +262,21 @@ def cmd_status(args) -> int:
     if not states:
         print("no jobs (use --all to include old finished jobs)")
         return 0
+    fancy = use_color()
+    st = Style(fancy)
+    width = shutil.get_terminal_size((120, 24)).columns if fancy else 120
     quota = None
     for s in states:
-        started = s.get("started_at") or 0
-        end = s.get("finished_at") or time.time()
-        line = (
-            f"{s['job_id']:34s} {s.get('phase', '?'):9s} {fmt_elapsed(end - started):>7s}  "
-            f"[{s.get('sandbox', '?')}] {Path(s.get('cwd', '')).name}"
-        )
-        if s.get("model"):
-            line += f"  {s['model']}/{s.get('effort', '?')}"
-        print(line)
-        print(f"  {s.get('prompt_preview', '')}")
-        if s.get("phase") not in TERMINAL_PHASES:
-            print(f"  ↳ {s.get('activity', '')}")
-        if s.get("branch"):
-            print(f"  branch: {s['branch']}  worktree: {s.get('worktree', '')}")
-        if s.get("thread_id"):
-            print(f"  resume: codex resume {s['thread_id']}")
+        if fancy:
+            print_job_fancy(st, s, width)
+        else:
+            print_job_plain(s)
         q = s.get("quota")
         if q and (quota is None or (q.get("at") or 0) > (quota.get("at") or 0)):
             quota = q
     if quota:
-        mins = quota.get("window_mins") or 0
-        if mins >= 1440:
-            window = f"{round(mins / 1440)}d"
-        elif mins >= 60:
-            window = f"{round(mins / 60)}h"
-        else:
-            window = f"{mins}m"
-        print(f"\ncodex quota: {quota.get('used_percent')}% of {window} window used"
-              f" (plan: {quota.get('plan', '?')})")
+        prefix = "" if fancy else "\n"
+        print(f"{prefix}{quota_line(st, quota, fancy)}")
     return 0
 
 
