@@ -553,8 +553,11 @@ def _handoff_locked(args, job_id: str) -> int:
     if spec.get("worktree") and common_dir and os.path.isdir(common_dir):
         sources.append(Path(common_dir))
     for source in sources:
+        # --no-implied-dirs: with --relative, rsync otherwise tries to copy
+        # attributes (times, perms) onto root-owned implied parents like
+        # /Users or /private/tmp and dies with EPERM.
         copied = run_handoff_command([
-            rsync_bin, "--archive", "--relative", "--rsh", ssh_bin,
+            rsync_bin, "--archive", "--relative", "--no-implied-dirs", "--rsh", ssh_bin,
             "--", str(source), f"{args.host}:/",
         ])
         if copied.returncode != 0:
