@@ -36,6 +36,7 @@ codexspin status              # running + last 24h (--all for everything)
 codexspin await JOB [JOB...]  # block until done, print results
 codexspin result JOB [--json]
 codexspin send JOB "follow-up on the same codex thread"
+codexspin handoff JOB HOST ["continue on the remote"]
 codexspin cancel JOB [--hard]
 codexspin logs JOB
 codexspin doctor              # codex binary / app-server / auth / defaults
@@ -86,14 +87,37 @@ Job ids accept unambiguous prefixes. Every job records the codex thread id, so
 - State lives under `~/.codexspin/jobs/<job-id>/` (`CODEXSPIN_HOME` overrides).
 - `send` resumes the recorded thread (`thread/resume`) with a fresh runner.
 
+## Remote handoff
+
+`codexspin handoff <job> <host> [prompt]` migrates a job and resumes its Codex
+thread on another machine. A running job is cleanly cancelled first. The
+command then uses `rsync --relative` to copy the job's cwd tree, its rollout
+file under `~/.codex/sessions/`, and `~/.codexspin/jobs/<job-id>/` to the same
+absolute paths on the remote before running `codexspin send` there.
+
+The local files are never removed. The local `state.json` remains terminal and
+records `handed_off_to: <host>`. The remote machine is assumed to use the same
+username and home-directory layout, with `codexspin`, `codex`, and your Codex
+authentication already installed. After handoff, follow it with:
+
+```sh
+ssh <host> codexspin status <job-id>
+```
+
+When `prompt` is omitted, codexspin asks the remote agent to re-read its prior
+context and continue to completion. Set `CODEXSPIN_SSH_BIN` or
+`CODEXSPIN_RSYNC_BIN` to override the transport executables (defaults: `ssh`
+and `rsync`).
+
 Model/effort default to your `~/.codex/config.toml`; override with
 `-m/--model` and `-e/--effort`.
 
 Environment variables: `CODEXSPIN_HOME` (state root, default `~/.codexspin`),
 `CODEXSPIN_CODEX_BIN` (codex binary override — the test suite points it at a
-fake), `CODEXSPIN_SSH_BIN` (SSH binary override, default `ssh`), and
-`CODEXSPIN_STARTUP_TIMEOUT` (seconds to wait for app-server responses during
-startup, default 180).
+fake), `CODEXSPIN_SSH_BIN` (ssh transport override, default `ssh`),
+`CODEXSPIN_RSYNC_BIN` (rsync transport override, default `rsync`), and
+`CODEXSPIN_STARTUP_TIMEOUT` (seconds to wait for app-server responses
+during startup, default 180).
 
 ## Tests
 

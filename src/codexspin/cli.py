@@ -5,6 +5,7 @@
   codexspin result JOB [--json]
   codexspin await JOB [JOB...] [--timeout SECS]
   codexspin send JOB "follow-up"
+  codexspin handoff JOB HOST ["follow-up"]
   codexspin cancel JOB [--hard]
   codexspin logs JOB [-n LINES]
   codexspin doctor
@@ -101,7 +102,7 @@ def _run_remote(args, argv: list[str]) -> int:
 
     forwarded = _forwarded_argv(argv, prompt_index)
     ssh_bin = os.environ.get("CODEXSPIN_SSH_BIN", "ssh")
-    command = [ssh_bin, str(args.host), "codexspin", *forwarded]
+    command = [ssh_bin, str(args.remote_host), "codexspin", *forwarded]
     try:
         if prompt is None:
             completed = subprocess.run(command)
@@ -116,7 +117,16 @@ def _run_remote(args, argv: list[str]) -> int:
 
 
 def _add_host_argument(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--host", metavar="NAME", help="run this command on NAME over ssh")
+    # dest is remote_host so it never collides with positional args named
+    # "host" (e.g. handoff's target machine).
+    parser.add_argument("--host", dest="remote_host", metavar="NAME",
+                        help="run this command on NAME over ssh")
+
+
+_HANDOFF_PROMPT = (
+    "You were handed off to another machine mid-task. "
+    "Re-read your prior context and continue to completion."
+)
 
 
 def launch_runner(jd: Path, resume: bool = False) -> int:
@@ -400,8 +410,10 @@ def cmd_await(args) -> int:
 
 def cmd_send(args) -> int:
     job_id = resolve_job_id(args.job)
-    jd = job_dir(job_id)
     prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
+    if not prompt.strip():
+        raise SystemExit("codexspin: empty prompt")
+    jd = job_dir(job_id)
     # Exclusive lock over check-then-launch: two concurrent sends must not
     # put two runners on the same thread.
     with open(jd / "cli.lock", "w") as lock:
@@ -425,6 +437,110 @@ def cmd_send(args) -> int:
         state["runner_pid"] = pid
         write_json(jd / "state.json", state)
     print(job_id)
+    return 0
+
+
+def find_session_rollout(thread_id: str) -> Path:
+    sessions = Path.home() / ".codex" / "sessions"
+    if sessions.is_dir():
+        matches = [path for path in sessions.rglob("*")
+                   if path.is_file() and thread_id in path.name]
+        if matches:
+            return max(matches, key=lambda path: path.stat().st_mtime)
+    raise SystemExit(
+        f"codexspin: no Codex session rollout file found for thread {thread_id} under {sessions}"
+    )
+
+
+def run_handoff_command(command: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(command, input=input_text, capture_output=True, text=True)
+    except OSError as exc:
+        raise SystemExit(f"codexspin: cannot run {command[0]}: {exc}") from exc
+
+
+def remote_codexspin_missing(result: subprocess.CompletedProcess) -> bool:
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    return result.returncode == 127 or "command not found" in output or "codexspin: not found" in output
+
+
+def remote_install_error(host: str) -> SystemExit:
+    return SystemExit(
+        f"codexspin: codexspin is not installed on {host}; install it there and ensure it is on PATH"
+    )
+
+
+def command_error(prefix: str, result: subprocess.CompletedProcess) -> SystemExit:
+    detail = (result.stderr or result.stdout).strip()
+    return SystemExit(f"codexspin: {prefix}: {detail or f'exit {result.returncode}'}")
+
+
+def cmd_handoff(args) -> int:
+    job_id = resolve_job_id(args.job)
+    state = load_state(job_id)
+    if state is None:
+        raise SystemExit(f"codexspin: cannot read state for {job_id}")
+
+    if state.get("phase") not in TERMINAL_PHASES:
+        cmd_cancel(argparse.Namespace(job=job_id, hard=False))
+        state = load_state(job_id) or {}
+    if state.get("phase") not in TERMINAL_PHASES:
+        raise SystemExit(f"codexspin: {job_id} did not reach a terminal phase after cancellation")
+
+    # load_state can synthesize phase=died for a vanished runner. Persist that
+    # terminal phase so the state copied to the remote can always be resumed.
+    state_path = job_dir(job_id) / "state.json"
+    disk_state = read_json(state_path) or {}
+    if disk_state.get("phase") not in TERMINAL_PHASES:
+        disk_state.update(state)
+        disk_state.setdefault("finished_at", time.time())
+        write_json(state_path, disk_state)
+        state = disk_state
+
+    thread_id = state.get("thread_id")
+    if not thread_id:
+        raise SystemExit(f"codexspin: {job_id} has no thread_id to hand off")
+    rollout = find_session_rollout(thread_id)
+
+    spec = read_json(job_dir(job_id) / "job.json") or {}
+    cwd_tree = Path(spec.get("worktree") or spec.get("cwd") or state.get("cwd") or "")
+    if not cwd_tree.is_absolute() or not cwd_tree.is_dir():
+        raise SystemExit(f"codexspin: job cwd tree does not exist: {cwd_tree}")
+
+    prompt = _HANDOFF_PROMPT if args.prompt is None else args.prompt
+    if prompt == "-":
+        prompt = sys.stdin.read()
+    if not prompt.strip():
+        raise SystemExit("codexspin: empty prompt")
+
+    ssh_bin = os.environ.get("CODEXSPIN_SSH_BIN", "ssh")
+    rsync_bin = os.environ.get("CODEXSPIN_RSYNC_BIN", "rsync")
+    probe = run_handoff_command([ssh_bin, args.host, "codexspin", "--help"])
+    if probe.returncode != 0:
+        if remote_codexspin_missing(probe):
+            raise remote_install_error(args.host)
+        raise command_error(f"could not reach codexspin on {args.host}", probe)
+
+    for source in (cwd_tree, rollout, job_dir(job_id).resolve()):
+        copied = run_handoff_command([
+            rsync_bin, "--archive", "--relative", "--", str(source), f"{args.host}:/",
+        ])
+        if copied.returncode != 0:
+            raise command_error(f"rsync failed for {source}", copied)
+
+    resumed = run_handoff_command(
+        [ssh_bin, args.host, "codexspin", "send", job_id, "-"], input_text=prompt,
+    )
+    if resumed.returncode != 0:
+        if remote_codexspin_missing(resumed):
+            raise remote_install_error(args.host)
+        raise command_error(f"remote resume failed on {args.host}", resumed)
+
+    local_state = read_json(state_path) or state
+    local_state["handed_off_to"] = args.host
+    write_json(state_path, local_state)
+    print(job_id)
+    print(f"ssh {args.host} codexspin status {job_id}")
     return 0
 
 
@@ -606,6 +722,12 @@ def main(argv: list[str] | None = None) -> int:
     _add_host_argument(p)
     p.set_defaults(fn=cmd_send)
 
+    p = sub.add_parser("handoff", help="copy a job to another machine and resume it there")
+    p.add_argument("job")
+    p.add_argument("host")
+    p.add_argument("prompt", nargs="?", help="resume prompt ('-' reads stdin)")
+    p.set_defaults(fn=cmd_handoff)
+
     p = sub.add_parser("cancel", help="interrupt a running job")
     p.add_argument("job")
     p.add_argument("--hard", action="store_true", help="SIGKILL the runner process group")
@@ -628,7 +750,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_gc)
 
     args = parser.parse_args([_Arg(value, index) for index, value in enumerate(raw_argv)])
-    if args.host is not None:
+    if getattr(args, "remote_host", None) is not None:
         return _run_remote(args, raw_argv)
     return args.fn(args)
 
