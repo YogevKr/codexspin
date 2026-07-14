@@ -1,18 +1,20 @@
 """codexspin — spin and manage parallel Codex sessions.
 
-  codexspin spawn [-s SANDBOX | --yolo] [-m MODEL] [-e EFFORT] [-C DIR] [-n NAME] "prompt"
+  codexspin spawn [-s SANDBOX | --yolo] [-w|--worktree] [--max-minutes N] [-m MODEL] [-e EFFORT] [-C DIR] [-n NAME] "prompt"
   codexspin status [JOB]
   codexspin result JOB [--json]
   codexspin await JOB [JOB...] [--timeout SECS]
   codexspin send JOB "follow-up"
   codexspin cancel JOB [--hard]
   codexspin logs JOB [-n LINES]
+  codexspin doctor
   codexspin gc [--keep-days N]
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
@@ -60,11 +62,40 @@ def launch_runner(jd: Path, resume: bool = False) -> int:
     return int(out.stdout.strip())
 
 
+def git(repo: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+
+
+def create_worktree(cwd: str, job_id: str) -> dict:
+    top = git(cwd, "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        raise SystemExit(f"codexspin: --worktree requires a git repository at {cwd}")
+    repo_root = top.stdout.strip()
+    # The common git dir survives even if the spawning worktree is later
+    # removed — record it so gc can always clean up.
+    common = git(repo_root, "rev-parse", "--git-common-dir")
+    common_dir = common.stdout.strip() if common.returncode == 0 else ""
+    if common_dir and not os.path.isabs(common_dir):
+        common_dir = os.path.normpath(os.path.join(repo_root, common_dir))
+    wt_path = str(jobs_root().parent / "worktrees" / job_id)
+    branch = f"codexspin/{job_id}"
+    Path(wt_path).parent.mkdir(parents=True, exist_ok=True)
+    added = git(repo_root, "worktree", "add", "-b", branch, wt_path, "HEAD")
+    if added.returncode != 0:
+        raise SystemExit(f"codexspin: worktree add failed:\n{added.stderr.strip()}")
+    return {"repo_root": repo_root, "worktree": wt_path, "branch": branch,
+            "git_common_dir": common_dir}
+
+
 def cmd_spawn(args) -> int:
     sandbox = "danger-full-access" if args.yolo else args.sandbox
-    cwd = os.path.abspath(args.cwd or os.getcwd())
+    # realpath: symlinked paths (macOS /tmp!) must match git's physical
+    # toplevel or the worktree-relative math escapes the worktree.
+    cwd = os.path.realpath(args.cwd or os.getcwd())
     if not os.path.isdir(cwd):
         raise SystemExit(f"codexspin: cwd does not exist: {cwd}")
+    if args.max_minutes is not None and args.max_minutes <= 0:
+        raise SystemExit("codexspin: --max-minutes must be positive")
     prompt = args.prompt
     if prompt == "-":
         prompt = sys.stdin.read()
@@ -72,6 +103,11 @@ def cmd_spawn(args) -> int:
         raise SystemExit("codexspin: empty prompt")
 
     job_id = new_job_id(args.name)
+    wt = create_worktree(cwd, job_id) if args.worktree else {}
+    if wt:
+        # Preserve a requested subdirectory: -C repo/pkg maps to <worktree>/pkg.
+        rel = os.path.relpath(cwd, wt["repo_root"])
+        cwd = os.path.normpath(os.path.join(wt["worktree"], rel))
     jd = job_dir(job_id)
     jd.mkdir(parents=True)
     write_json(jd / "job.json", {
@@ -81,7 +117,9 @@ def cmd_spawn(args) -> int:
         "sandbox": sandbox,
         "model": args.model,
         "effort": args.effort,
+        "max_minutes": args.max_minutes,
         "created_at": time.time(),
+        **wt,
     })
     write_json(jd / "state.json", {
         "job_id": job_id,
@@ -91,6 +129,8 @@ def cmd_spawn(args) -> int:
         "prompt_preview": " ".join(prompt.split())[:120],
         "started_at": time.time(),
         "activity": "launching runner",
+        **({"branch": wt["branch"], "worktree": wt["worktree"], "repo_root": wt["repo_root"],
+            "git_common_dir": wt["git_common_dir"]} if wt else {}),
     })
     pid = launch_runner(jd)
     state = read_json(jd / "state.json") or {}
@@ -115,6 +155,7 @@ def cmd_status(args) -> int:
     if not states:
         print("no jobs (use --all to include old finished jobs)")
         return 0
+    quota = None
     for s in states:
         started = s.get("started_at") or 0
         end = s.get("finished_at") or time.time()
@@ -122,12 +163,29 @@ def cmd_status(args) -> int:
             f"{s['job_id']:34s} {s.get('phase', '?'):9s} {fmt_elapsed(end - started):>7s}  "
             f"[{s.get('sandbox', '?')}] {Path(s.get('cwd', '')).name}"
         )
+        if s.get("model"):
+            line += f"  {s['model']}/{s.get('effort', '?')}"
         print(line)
         print(f"  {s.get('prompt_preview', '')}")
         if s.get("phase") not in TERMINAL_PHASES:
             print(f"  ↳ {s.get('activity', '')}")
+        if s.get("branch"):
+            print(f"  branch: {s['branch']}  worktree: {s.get('worktree', '')}")
         if s.get("thread_id"):
             print(f"  resume: codex resume {s['thread_id']}")
+        q = s.get("quota")
+        if q and (quota is None or (q.get("at") or 0) > (quota.get("at") or 0)):
+            quota = q
+    if quota:
+        mins = quota.get("window_mins") or 0
+        if mins >= 1440:
+            window = f"{round(mins / 1440)}d"
+        elif mins >= 60:
+            window = f"{round(mins / 60)}h"
+        else:
+            window = f"{mins}m"
+        print(f"\ncodex quota: {quota.get('used_percent')}% of {window} window used"
+              f" (plan: {quota.get('plan', '?')})")
     return 0
 
 
@@ -182,24 +240,28 @@ def cmd_await(args) -> int:
 def cmd_send(args) -> int:
     job_id = resolve_job_id(args.job)
     jd = job_dir(job_id)
-    state = load_state(job_id) or {}
-    if state.get("phase") not in TERMINAL_PHASES:
-        raise SystemExit(f"codexspin: {job_id} is still {state.get('phase', 'unknown')}; await or cancel it first")
-    if not state.get("thread_id"):
-        raise SystemExit(f"codexspin: {job_id} has no thread to resume")
-    spec = read_json(jd / "job.json") or {}
-    spec["prompt"] = args.prompt
-    write_json(jd / "job.json", spec)
-    # Invalidate the previous turn's result so `result` reports "no result
-    # yet" during the new turn; history stays in results.jsonl.
-    (jd / "result.json").unlink(missing_ok=True)
-    state.update(phase="starting", activity="resuming thread",
-                 prompt_preview=" ".join(args.prompt.split())[:120], started_at=time.time())
-    state.pop("finished_at", None)
-    write_json(jd / "state.json", state)
-    pid = launch_runner(jd, resume=True)
-    state["runner_pid"] = pid
-    write_json(jd / "state.json", state)
+    # Exclusive lock over check-then-launch: two concurrent sends must not
+    # put two runners on the same thread.
+    with open(jd / "cli.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = load_state(job_id) or {}
+        if state.get("phase") not in TERMINAL_PHASES:
+            raise SystemExit(f"codexspin: {job_id} is still {state.get('phase', 'unknown')}; await or cancel it first")
+        if not state.get("thread_id"):
+            raise SystemExit(f"codexspin: {job_id} has no thread to resume")
+        spec = read_json(jd / "job.json") or {}
+        spec["prompt"] = args.prompt
+        write_json(jd / "job.json", spec)
+        # Invalidate the previous turn's result so `result` reports "no result
+        # yet" during the new turn; history stays in results.jsonl.
+        (jd / "result.json").unlink(missing_ok=True)
+        state.update(phase="starting", activity="resuming thread",
+                     prompt_preview=" ".join(args.prompt.split())[:120], started_at=time.time())
+        state.pop("finished_at", None)
+        write_json(jd / "state.json", state)
+        pid = launch_runner(jd, resume=True)
+        state["runner_pid"] = pid
+        write_json(jd / "state.json", state)
     print(job_id)
     return 0
 
@@ -263,14 +325,75 @@ def cmd_logs(args) -> int:
     return 0
 
 
+def remove_worktree(state: dict) -> bool:
+    """Remove a job's worktree only when it has no uncommitted work; committed
+    work survives on the codexspin/<job-id> branch. Returns False to keep."""
+    wt = state.get("worktree")
+    if not wt or not os.path.isdir(wt):
+        return True
+    dirty = git(wt, "status", "--porcelain")
+    if dirty.returncode != 0 or dirty.stdout.strip():
+        return False
+    # Prefer the common git dir — it outlives the worktree we spawned from.
+    for repo in (state.get("git_common_dir"), state.get("repo_root")):
+        if repo and os.path.isdir(repo):
+            return git(repo, "worktree", "remove", wt).returncode == 0
+    # The repository itself is gone; the admin entry died with it.
+    shutil.rmtree(wt, ignore_errors=True)
+    return True
+
+
 def cmd_gc(args) -> int:
     cutoff = time.time() - args.keep_days * 24 * 3600
-    removed = 0
+    removed, kept = 0, []
     for state in list_jobs():
         if state.get("phase") in TERMINAL_PHASES and (state.get("finished_at") or state.get("started_at") or 0) < cutoff:
+            if not remove_worktree(state):
+                kept.append(state["job_id"])
+                continue
             shutil.rmtree(job_dir(state["job_id"]), ignore_errors=True)
             removed += 1
     print(f"removed {removed} finished job(s) older than {args.keep_days}d")
+    for job_id in kept:
+        print(f"kept {job_id}: worktree has uncommitted changes")
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    from .appserver import AppServerClient, AppServerError
+
+    try:
+        version = subprocess.run([os.environ.get("CODEXSPIN_CODEX_BIN", "codex"), "--version"],
+                                 capture_output=True, text=True)
+    except OSError:
+        print("codex binary: NOT FOUND on PATH")
+        return 1
+    if version.returncode != 0:
+        print(f"codex binary: FAILED — {version.stderr.strip() or version.stdout.strip()}")
+        return 1
+    print(f"codex binary: {version.stdout.strip()}")
+    try:
+        client = AppServerClient(cwd=os.getcwd())
+        client.initialize()
+        account_resp = client.request("account/read", {"refreshToken": False}, timeout=30)
+        config = client.request("config/read", {"includeLayers": False, "cwd": os.getcwd()},
+                                timeout=30).get("config") or {}
+        client.close()
+    except (AppServerError, OSError) as exc:
+        print(f"app-server: FAILED — {exc}")
+        return 1
+    print("app-server: ok")
+    account = account_resp.get("account")
+    if not account:
+        if account_resp.get("requiresOpenaiAuth"):
+            print("auth: NOT LOGGED IN — run `codex login`")
+            return 1
+        print("auth: none required (custom provider)")
+    else:
+        kind = account.get("type", "?")
+        who = account.get("email") or account.get("planType") or ""
+        print(f"auth: {kind} {who}".rstrip())
+    print(f"default model: {config.get('model', '?')} / {config.get('model_reasoning_effort', '?')}")
     return 0
 
 
@@ -285,9 +408,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--yolo", action="store_true", help="shortcut for --sandbox danger-full-access")
     p.add_argument("-m", "--model", default=None)
     p.add_argument("-e", "--effort", default=None,
-                   choices=["minimal", "low", "medium", "high", "xhigh"])
+                   choices=["none", "minimal", "low", "medium", "high", "xhigh"])
     p.add_argument("-C", "--cwd", default=None, help="working directory (default: current)")
     p.add_argument("-n", "--name", default=None, help="job name used in the job id")
+    p.add_argument("-w", "--worktree", action="store_true",
+                   help="run in a fresh git worktree (branch codexspin/<job-id>)")
+    p.add_argument("--max-minutes", type=float, default=None,
+                   help="interrupt the job after this many minutes (phase: timeout)")
     p.set_defaults(fn=cmd_spawn)
 
     p = sub.add_parser("status", help="show jobs (running + last 24h by default)")
@@ -320,6 +447,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("job")
     p.add_argument("-n", "--lines", type=int, default=40)
     p.set_defaults(fn=cmd_logs)
+
+    p = sub.add_parser("doctor", help="check codex binary, app-server handshake, auth, defaults")
+    p.set_defaults(fn=cmd_doctor)
 
     p = sub.add_parser("gc", help="delete old finished jobs")
     p.add_argument("--keep-days", type=int, default=7)

@@ -31,6 +31,10 @@ def notify(method, params):
 
 def run_turn():
     notify("turn/started", {"threadId": THREAD_ID, "turn": {"id": TURN_ID, "status": "inProgress"}})
+    notify("account/rateLimits/updated", {"rateLimits": {
+        "planType": "pro",
+        "primary": {"usedPercent": 42, "windowDurationMins": 10080},
+    }})
     if MODE == "die":
         os._exit(1)
     if MODE == "retryerr":
@@ -83,5 +87,15 @@ for line in sys.stdin:
     elif method == "turn/interrupt":
         interrupted.set()
         send({"id": msg_id, "result": {}})
+        notify("turn/completed", {"threadId": THREAD_ID,
+                                  "turn": {"id": TURN_ID, "status": "interrupted", "error": None}})
+    elif method == "config/read":
+        send({"id": msg_id, "result": {"config": {"model": "fake-model-1",
+                                                  "model_reasoning_effort": "medium"}}})
+    elif method == "account/read":
+        if MODE == "noauth":
+            send({"id": msg_id, "result": {"account": None, "requiresOpenaiAuth": True}})
+        else:
+            send({"id": msg_id, "result": {"account": {"type": "chatgpt", "email": "fake@test.local"}}})
     elif msg_id is not None:
         send({"id": msg_id, "result": {}})

@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import subprocess
 import time
 from pathlib import Path
 
@@ -213,3 +214,147 @@ def test_result_json_exit_code_on_failure(capsys, monkeypatch):
     out = capsys.readouterr().out
     assert rc == 1
     assert json.loads(out)["phase"] == "failed"
+
+
+def make_repo(path):
+    path.mkdir(exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    (path / "a.txt").write_text("a\n")
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "init"], cwd=path, check=True)
+    return path
+
+
+def test_worktree_spawn_and_gc(capsys, tmp_path):
+    repo = make_repo(tmp_path / "repo")
+    rc = cli.main(["spawn", "-w", "-C", str(repo), "-n", "wt", "do the thing"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    spec = json.loads((jobs.job_dir(job_id) / "job.json").read_text())
+    assert spec["branch"] == f"codexspin/{job_id}"
+    assert spec["cwd"] == spec["worktree"] != str(repo)
+    assert Path(spec["worktree"]).is_dir()
+    wait_terminal(job_id)
+
+    cli.main(["status", job_id])
+    out = capsys.readouterr().out
+    assert f"branch: codexspin/{job_id}" in out
+
+    # dirty worktree survives gc; clean one is removed
+    (Path(spec["worktree"]) / "wip.txt").write_text("uncommitted\n")
+    cli.main(["gc", "--keep-days", "0"])
+    assert "kept" in capsys.readouterr().out
+    assert Path(spec["worktree"]).is_dir()
+
+    (Path(spec["worktree"]) / "wip.txt").unlink()
+    cli.main(["gc", "--keep-days", "0"])
+    capsys.readouterr()
+    assert not Path(spec["worktree"]).is_dir()
+    assert not jobs.job_dir(job_id).is_dir()
+    branches = subprocess.run(["git", "branch"], cwd=repo, capture_output=True, text=True).stdout
+    assert f"codexspin/{job_id}" in branches  # committed work survives on the branch
+
+
+def test_worktree_requires_git_repo(tmp_path):
+    with pytest.raises(SystemExit, match="requires a git repository"):
+        cli.main(["spawn", "-w", "-C", str(tmp_path), "nope"])
+
+
+def test_max_minutes_timeout(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "slow")
+    rc = cli.main(["spawn", "--max-minutes", "0.03", "timeout me"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    state = wait_terminal(job_id)
+    assert state["phase"] == "timeout"
+    result = json.loads((jobs.job_dir(job_id) / "result.json").read_text())
+    assert "max runtime" in result["error"]["message"]
+
+
+def test_status_shows_model_and_quota(capsys):
+    job_id = spawn(capsys)
+    wait_terminal(job_id)
+    cli.main(["status", job_id])
+    out = capsys.readouterr().out
+    assert "fake-model-1/medium" in out
+    assert "codex quota: 42%" in out
+    assert "plan: pro" in out
+
+
+def test_doctor(capsys):
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "app-server: ok" in out
+    assert "chatgpt fake@test.local" in out
+    assert "fake-model-1" in out
+
+
+def test_doctor_missing_binary(capsys, monkeypatch):
+    monkeypatch.setenv("CODEXSPIN_CODEX_BIN", "/nonexistent/codex")
+    rc = cli.main(["doctor"])
+    assert rc == 1
+    assert "NOT FOUND" in capsys.readouterr().out
+
+
+def test_doctor_logged_out(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "noauth")
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "NOT LOGGED IN" in out
+
+
+def test_worktree_preserves_subdir(capsys, tmp_path):
+    repo = make_repo(tmp_path / "mono")
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "b.txt").write_text("b\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "pkg"], cwd=repo, check=True)
+    rc = cli.main(["spawn", "-w", "-C", str(repo / "pkg"), "-n", "sub", "do the thing"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    spec = json.loads((jobs.job_dir(job_id) / "job.json").read_text())
+    assert spec["cwd"] == str(Path(spec["worktree"]) / "pkg")
+    wait_terminal(job_id)
+
+
+def test_timeout_covers_startup(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "hang")
+    monkeypatch.setenv("CODEXSPIN_STARTUP_TIMEOUT", "60")
+    rc = cli.main(["spawn", "--max-minutes", "0.02", "stall out"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    state = wait_terminal(job_id, timeout=15)
+    assert state["phase"] == "timeout"
+
+
+def test_worktree_via_symlinked_path(capsys, tmp_path):
+    repo = make_repo(tmp_path / "realrepo")
+    link = tmp_path / "linkrepo"
+    os.symlink(repo, link)
+    rc = cli.main(["spawn", "-w", "-C", str(link), "-n", "sym", "do the thing"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    spec = json.loads((jobs.job_dir(job_id) / "job.json").read_text())
+    assert spec["cwd"] == spec["worktree"]  # no ../ escape
+    assert spec["git_common_dir"].endswith(".git")
+    wait_terminal(job_id)
+
+
+def test_max_minutes_rejects_zero(tmp_path):
+    with pytest.raises(SystemExit, match="must be positive"):
+        cli.main(["spawn", "--max-minutes", "0", "nope"])
+
+
+def test_quota_window_formatting(capsys):
+    job_id = spawn(capsys)
+    wait_terminal(job_id)
+    state_path = jobs.job_dir(job_id) / "state.json"
+    state = json.loads(state_path.read_text())
+    state["quota"] = {"used_percent": 12, "window_mins": 300, "plan": "pro", "at": time.time()}
+    state_path.write_text(json.dumps(state))
+    cli.main(["status", job_id])
+    assert "12% of 5h window" in capsys.readouterr().out

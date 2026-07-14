@@ -24,8 +24,13 @@ Requires `codex` on PATH, already authenticated (`codex login`).
 ```sh
 # spawn detached jobs (default sandbox: workspace-write)
 codexspin spawn -n pagerduty "Implement the PagerDuty integration... "
-codexspin spawn -n e2e --yolo "Run the playwright suite and fix failures"
+codexspin spawn -n e2e --yolo -w "Run the playwright suite and fix failures"
 codexspin spawn -s read-only "Explain the auth flow in this repo"
+
+# parallel fleet: one worktree per job, no tree conflicts
+codexspin spawn -w -n fix-a "Fix the retry logic..."
+codexspin spawn -w -n fix-b "Fix the pagination..."
+codexspin spawn -w -n fix-c --max-minutes 30 "Refactor the dispatcher..."
 
 codexspin status              # running + last 24h (--all for everything)
 codexspin await JOB [JOB...]  # block until done, print results
@@ -33,11 +38,20 @@ codexspin result JOB [--json]
 codexspin send JOB "follow-up on the same codex thread"
 codexspin cancel JOB [--hard]
 codexspin logs JOB
+codexspin doctor              # codex binary / app-server / auth / defaults
 codexspin gc --keep-days 7
 ```
 
 Job ids accept unambiguous prefixes. Every job records the codex thread id, so
 `codex resume <thread-id>` drops you into the same session interactively.
+
+- `-w/--worktree` runs the job in a fresh git worktree
+  (`~/.codexspin/worktrees/<job-id>`, branch `codexspin/<job-id>`) so parallel
+  jobs never fight over the tree. `gc` removes only clean worktrees —
+  committed work survives on the branch, uncommitted work keeps the job.
+- `--max-minutes N` interrupts a runaway job (phase `timeout`).
+- `status` shows each job's resolved model/effort and the latest ChatGPT
+  quota reading (`account/rateLimits/updated` pushed by the app-server).
 
 ## How it works
 
@@ -53,6 +67,11 @@ Job ids accept unambiguous prefixes. Every job records the codex thread id, so
 
 Model/effort default to your `~/.codex/config.toml`; override with
 `-m/--model` and `-e/--effort`.
+
+Environment variables: `CODEXSPIN_HOME` (state root, default `~/.codexspin`),
+`CODEXSPIN_CODEX_BIN` (codex binary override — the test suite points it at a
+fake), `CODEXSPIN_STARTUP_TIMEOUT` (seconds to wait for app-server responses
+during startup, default 180).
 
 ## Tests
 

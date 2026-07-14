@@ -18,10 +18,11 @@ import re
 import subprocess
 import string
 import time
+import uuid
 from pathlib import Path
 
 SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
-TERMINAL_PHASES = ("done", "failed", "cancelled", "died")
+TERMINAL_PHASES = ("done", "failed", "cancelled", "died", "timeout")
 
 
 def jobs_root() -> Path:
@@ -41,9 +42,9 @@ def job_dir(job_id: str) -> Path:
 
 
 def write_json(path: Path, data: dict) -> None:
-    # Writer-unique tmp name: the CLI and a detached runner may write the same
-    # state file concurrently, and a shared tmp path races on the rename.
-    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+    # Writer-unique tmp name: concurrent writers (CLI vs runner, or two runner
+    # threads) must never share a tmp path or the renames race.
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
 

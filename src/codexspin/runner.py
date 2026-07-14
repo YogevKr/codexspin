@@ -39,13 +39,19 @@ class Runner:
         self.touched_files: list[str] = []
         self.command_count = 0
         self.cancelled = False
+        self.timed_out = False
+        self._state_lock = threading.Lock()
 
     def logline(self, msg: str) -> None:
         self.log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
 
     def set_state(self, **updates) -> None:
-        self.state.update(updates, updated_at=time.time())
-        write_json(self.dir / "state.json", self.state)
+        # The deadline timer, the stdout notification thread, and the main
+        # thread all write state; serialize so a snapshot is never taken
+        # mid-mutation.
+        with self._state_lock:
+            self.state.update(updates, updated_at=time.time())
+            write_json(self.dir / "state.json", dict(self.state))
 
     def on_notification(self, msg: dict) -> None:
         self.events.write(json.dumps(msg) + "\n")
@@ -82,6 +88,16 @@ class Runner:
         elif method == "turn/completed":
             self.final_turn = params.get("turn") or {}
             self.turn_done.set()
+        elif method == "account/rateLimits/updated":
+            limits = (params.get("rateLimits") or {})
+            primary = limits.get("primary") or {}
+            if primary.get("usedPercent") is not None:
+                self.set_state(quota={
+                    "used_percent": primary.get("usedPercent"),
+                    "window_mins": primary.get("windowDurationMins"),
+                    "plan": limits.get("planType"),
+                    "at": time.time(),
+                })
 
     @staticmethod
     def describe_item(item: dict) -> str | None:
@@ -100,12 +116,15 @@ class Runner:
             return "writing answer"
         return None
 
-    def handle_sigterm(self, *_args) -> None:
-        self.cancelled = True
-        self.logline("SIGTERM received, interrupting turn")
+    def interrupt_turn(self, reason: str) -> None:
+        self.logline(f"{reason}: interrupting turn")
         if self.client and self.thread_id and self.turn_id:
             try:
                 self.client.request("turn/interrupt", {"threadId": self.thread_id, "turnId": self.turn_id}, timeout=10)
+                # Give codex a moment to emit turn/completed(interrupted) and
+                # finish writing the session rollout, so the thread stays
+                # cleanly resumable; the notification sets turn_done for us.
+                self.turn_done.wait(timeout=5)
             except AppServerError as exc:
                 self.logline(f"turn/interrupt failed: {exc}")
         elif self.client:
@@ -114,6 +133,23 @@ class Runner:
             # nobody wants (and that cancel already reported as cancelled).
             self.client.close()
         self.turn_done.set()
+
+    def handle_sigterm(self, *_args) -> None:
+        self.cancelled = True
+        self.interrupt_turn("SIGTERM received")
+
+    def handle_deadline(self) -> None:
+        if self.turn_done.is_set():
+            return
+        self.timed_out = True
+        self.set_state(activity="max runtime reached, interrupting")
+        self.interrupt_turn("deadline reached")
+
+    def check_aborted(self) -> None:
+        """Between startup steps: stop immediately if the deadline or a cancel
+        fired while no turn existed yet to interrupt."""
+        if self.timed_out or self.cancelled:
+            raise AppServerError("aborted during startup")
 
     def handle_client_close(self) -> None:
         if not self.turn_done.is_set():
@@ -126,12 +162,31 @@ class Runner:
     def run(self) -> int:
         signal.signal(signal.SIGTERM, self.handle_sigterm)
         spec = self.spec
+        # The runtime budget covers the WHOLE job including startup — a
+        # stalled app-server handshake must not extend --max-minutes.
+        deadline_timer = None
+        if spec.get("max_minutes"):
+            deadline_timer = threading.Timer(spec["max_minutes"] * 60, self.handle_deadline)
+            deadline_timer.daemon = True
+            deadline_timer.start()
         try:
             self.set_state(phase="starting", activity="starting app-server", runner_pid=os.getpid())
             self.client = AppServerClient(cwd=spec["cwd"])
             self.client.notification_handler = self.on_notification
             self.client.on_close = self.handle_client_close
             self.client.initialize()
+
+            self.check_aborted()
+            try:
+                config = (self.client.request("config/read",
+                                              {"includeLayers": False, "cwd": spec["cwd"]},
+                                              timeout=min(30.0, STARTUP_TIMEOUT)).get("config") or {})
+            except AppServerError:
+                config = {}
+            self.set_state(
+                model=spec.get("model") or config.get("model") or "?",
+                effort=spec.get("effort") or config.get("model_reasoning_effort") or "?",
+            )
 
             thread_params = {
                 "cwd": spec["cwd"],
@@ -151,6 +206,7 @@ class Runner:
                 raise AppServerError(f"no thread id in response: {json.dumps(result)[:300]}")
             self.set_state(phase="starting", thread_id=self.thread_id, activity="thread ready")
 
+            self.check_aborted()
             self.client.request("turn/start", {
                 "threadId": self.thread_id,
                 "input": [{"type": "text", "text": spec["prompt"], "text_elements": []}],
@@ -164,17 +220,25 @@ class Runner:
             if self.cancelled:
                 self.finish("cancelled")
                 return 0
+            if self.timed_out:
+                self.finish("timeout", error={"message": f"exceeded max runtime of {spec.get('max_minutes')} minutes during startup"})
+                return 1
             stderr = "\n".join(self.client.stderr_tail[-10:]) if self.client else ""
             self.logline(f"failed: {exc}\n{stderr}")
             self.finish("failed", error={"message": str(exc), "stderr": stderr})
             return 1
         finally:
+            if deadline_timer:
+                deadline_timer.cancel()
             if self.client:
                 self.client.close()
 
         if self.cancelled:
             self.finish("cancelled")
             return 0
+        if self.timed_out:
+            self.finish("timeout", error={"message": f"exceeded max runtime of {spec.get('max_minutes')} minutes"})
+            return 1
         # The turn's own terminal status is authoritative: error notifications
         # that codex recovered from must not fail a completed turn.
         status = self.final_turn.get("status")
