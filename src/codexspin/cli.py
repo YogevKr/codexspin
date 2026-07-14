@@ -9,6 +9,8 @@
   codexspin logs JOB [-n LINES]
   codexspin doctor
   codexspin gc [--keep-days N]
+
+Add --host NAME to run any command above on NAME over ssh.
 """
 
 from __future__ import annotations
@@ -47,6 +49,74 @@ p = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, stdout=out,
                      stderr=out, start_new_session=True)
 print(p.pid)
 """
+
+_REMOTE_COMMANDS = frozenset({
+    "spawn", "status", "result", "await", "send", "cancel", "logs", "doctor", "gc",
+})
+_REMOTE_PROMPT_COMMANDS = frozenset({"spawn", "send"})
+_REMOTE_INSTALL_HINT = (
+    "codexspin: remote codexspin not found; install it there with: uv tool install codexspin"
+)
+
+
+class _Arg(str):
+    """An argv token that remembers its original position through argparse."""
+
+    def __new__(cls, value: str, index: int):
+        token = super().__new__(cls, value)
+        token.argv_index = index
+        return token
+
+
+def _forwarded_argv(argv: list[str], prompt_index: int | None) -> list[str]:
+    """Remove --host while preserving every other original argv token."""
+    forwarded = []
+    parse_options = True
+    index = 0
+    while index < len(argv):
+        value = argv[index]
+        if parse_options and value == "--":
+            parse_options = False
+        elif parse_options and value == "--host":
+            index += 2
+            continue
+        elif parse_options and value.startswith("--host="):
+            index += 1
+            continue
+        forwarded.append("-" if index == prompt_index else value)
+        index += 1
+    return forwarded
+
+
+def _run_remote(args, argv: list[str]) -> int:
+    command_name = str(args.cmd)
+    if command_name not in _REMOTE_COMMANDS:
+        raise SystemExit(f"codexspin: --host is not supported for {command_name}")
+
+    prompt = None
+    prompt_index = None
+    if command_name in _REMOTE_PROMPT_COMMANDS:
+        prompt = sys.stdin.read() if args.prompt == "-" else str(args.prompt)
+        prompt_index = args.prompt.argv_index
+
+    forwarded = _forwarded_argv(argv, prompt_index)
+    ssh_bin = os.environ.get("CODEXSPIN_SSH_BIN", "ssh")
+    command = [ssh_bin, str(args.host), "codexspin", *forwarded]
+    try:
+        if prompt is None:
+            completed = subprocess.run(command)
+        else:
+            completed = subprocess.run(command, input=prompt, text=True)
+    except FileNotFoundError:
+        print(f"codexspin: ssh binary not found: {ssh_bin}", file=sys.stderr)
+        return 127
+    if completed.returncode == 127:
+        print(_REMOTE_INSTALL_HINT, file=sys.stderr)
+    return completed.returncode
+
+
+def _add_host_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--host", metavar="NAME", help="run this command on NAME over ssh")
 
 
 def launch_runner(jd: Path, resume: bool = False) -> int:
@@ -331,6 +401,7 @@ def cmd_await(args) -> int:
 def cmd_send(args) -> int:
     job_id = resolve_job_id(args.job)
     jd = job_dir(job_id)
+    prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
     # Exclusive lock over check-then-launch: two concurrent sends must not
     # put two runners on the same thread.
     with open(jd / "cli.lock", "w") as lock:
@@ -341,13 +412,13 @@ def cmd_send(args) -> int:
         if not state.get("thread_id"):
             raise SystemExit(f"codexspin: {job_id} has no thread to resume")
         spec = read_json(jd / "job.json") or {}
-        spec["prompt"] = args.prompt
+        spec["prompt"] = prompt
         write_json(jd / "job.json", spec)
         # Invalidate the previous turn's result so `result` reports "no result
         # yet" during the new turn; history stays in results.jsonl.
         (jd / "result.json").unlink(missing_ok=True)
         state.update(phase="starting", activity="resuming thread",
-                     prompt_preview=" ".join(args.prompt.split())[:120], started_at=time.time())
+                     prompt_preview=" ".join(prompt.split())[:120], started_at=time.time())
         state.pop("finished_at", None)
         write_json(jd / "state.json", state)
         pid = launch_runner(jd, resume=True)
@@ -489,6 +560,7 @@ def cmd_doctor(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="codexspin", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -506,47 +578,58 @@ def main(argv: list[str] | None = None) -> int:
                    help="run in a fresh git worktree (branch codexspin/<job-id>)")
     p.add_argument("--max-minutes", type=float, default=None,
                    help="interrupt the job after this many minutes (phase: timeout)")
+    _add_host_argument(p)
     p.set_defaults(fn=cmd_spawn)
 
     p = sub.add_parser("status", help="show jobs (running + last 24h by default)")
     p.add_argument("job", nargs="?")
     p.add_argument("--all", action="store_true")
     p.add_argument("--json", action="store_true")
+    _add_host_argument(p)
     p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("result", help="print a job's result")
     p.add_argument("job")
     p.add_argument("--json", action="store_true")
+    _add_host_argument(p)
     p.set_defaults(fn=cmd_result)
 
     p = sub.add_parser("await", help="block until job(s) finish, print results")
     p.add_argument("job", nargs="+")
     p.add_argument("--timeout", type=float, default=None)
+    _add_host_argument(p)
     p.set_defaults(fn=cmd_await)
 
     p = sub.add_parser("send", help="follow-up turn on a finished job's thread")
     p.add_argument("job")
-    p.add_argument("prompt")
+    p.add_argument("prompt", help="follow-up prompt ('-' reads stdin)")
+    _add_host_argument(p)
     p.set_defaults(fn=cmd_send)
 
     p = sub.add_parser("cancel", help="interrupt a running job")
     p.add_argument("job")
     p.add_argument("--hard", action="store_true", help="SIGKILL the runner process group")
+    _add_host_argument(p)
     p.set_defaults(fn=cmd_cancel)
 
     p = sub.add_parser("logs", help="show recent job events")
     p.add_argument("job")
     p.add_argument("-n", "--lines", type=int, default=40)
+    _add_host_argument(p)
     p.set_defaults(fn=cmd_logs)
 
     p = sub.add_parser("doctor", help="check codex binary, app-server handshake, auth, defaults")
+    _add_host_argument(p)
     p.set_defaults(fn=cmd_doctor)
 
     p = sub.add_parser("gc", help="delete old finished jobs")
     p.add_argument("--keep-days", type=int, default=7)
+    _add_host_argument(p)
     p.set_defaults(fn=cmd_gc)
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args([_Arg(value, index) for index, value in enumerate(raw_argv)])
+    if args.host is not None:
+        return _run_remote(args, raw_argv)
     return args.fn(args)
 
 

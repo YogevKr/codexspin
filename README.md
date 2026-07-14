@@ -42,6 +42,27 @@ codexspin doctor              # codex binary / app-server / auth / defaults
 codexspin gc --keep-days 7
 ```
 
+## Remote hosts
+
+Add `--host NAME` to `spawn`, `status`, `result`, `await`, `send`, `cancel`,
+`logs`, `doctor`, or `gc` to run that same command on another machine:
+
+```sh
+codexspin spawn --host buildbox -C /srv/project "Fix the failing integration test"
+codexspin status --host buildbox
+codexspin await --host buildbox JOB
+```
+
+This executes the equivalent of `ssh NAME codexspin <command> <arguments>` and
+passes stdout, stderr, and the remote exit code through unchanged. `codexspin`
+must be installed on the remote machine. Spawn and send prompts are rewritten
+to `-` and piped over SSH stdin, so quotes and newlines never become part of the
+SSH command line.
+
+Job ids belong to the selected host. Likewise, `-C/--cwd` is interpreted on
+the remote machine exactly as supplied; codexspin does not translate local
+paths or job ids.
+
 Job ids accept unambiguous prefixes. Every job records the codex thread id, so
 `codex resume <thread-id>` drops you into the same session interactively.
 
@@ -70,8 +91,9 @@ Model/effort default to your `~/.codex/config.toml`; override with
 
 Environment variables: `CODEXSPIN_HOME` (state root, default `~/.codexspin`),
 `CODEXSPIN_CODEX_BIN` (codex binary override — the test suite points it at a
-fake), `CODEXSPIN_STARTUP_TIMEOUT` (seconds to wait for app-server responses
-during startup, default 180).
+fake), `CODEXSPIN_SSH_BIN` (SSH binary override, default `ssh`), and
+`CODEXSPIN_STARTUP_TIMEOUT` (seconds to wait for app-server responses during
+startup, default 180).
 
 ## Tests
 
@@ -82,3 +104,5 @@ uv run pytest
 The suite drives the real runner against a fake app-server
 (`tests/fake_codex.py`, selected via `CODEXSPIN_CODEX_BIN`), covering
 completion, failure, startup hang, cancel, resume, and dead-runner detection.
+Remote tests use `tests/fake_ssh.py` with a separate `CODEXSPIN_HOME` to model
+another machine.
