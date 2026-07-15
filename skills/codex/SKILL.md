@@ -83,9 +83,13 @@ Never hand it work on your own initiative, and never re-delegate follow-up
 work without a fresh ask.
 
 **Routing rule:** a single quick task you will wait on → `codex exec`
-(below). Anything backgrounded, parallel ("spin codex sessions for all"),
-or expecting follow-up turns → `codexspin` (next section). Never background
-a raw `codex exec` with nohup/watchdogs anymore — that pattern is retired.
+(below) or `codexspin run` (foreground spawn+wait+result — use this when you
+want the job record/worktree/heartbeat but not the multi-verb dance). Anything
+backgrounded, parallel ("spin codex sessions for all"), or expecting follow-up
+turns → `codexspin spawn` + `await` (next section). Don't reach for the full
+spawn→status→await→result ceremony on a single job you're going to watch —
+that friction is what `run` (or plain `codex exec`) exists to avoid. Never
+background a raw `codex exec` with nohup/watchdogs — that pattern is retired.
 
 1. Slice the task sharp before delegating — goal, constraints, and how to
    verify — using the prompt discipline above. An underspecified task stays
