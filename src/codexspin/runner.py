@@ -54,50 +54,64 @@ class Runner:
             write_json(self.dir / "state.json", dict(self.state))
 
     def on_notification(self, msg: dict) -> None:
-        self.events.write(json.dumps(msg) + "\n")
         method = msg.get("method")
         params = msg.get("params", {})
-        if method == "turn/started" and not self.turn_id:
-            self.turn_id = (params.get("turn") or {}).get("id")
-            self.set_state(phase="running", turn_id=self.turn_id, activity="turn started")
-        elif method == "item/started":
-            item = params.get("item") or {}
-            desc = self.describe_item(item)
-            if desc:
-                self.set_state(activity=desc)
-        elif method == "item/completed":
-            item = params.get("item") or {}
-            if item.get("type") == "agentMessage" and item.get("text"):
-                self.last_agent_message = item["text"]
-            elif item.get("type") == "fileChange":
-                for change in item.get("changes") or []:
-                    path = change.get("path")
-                    if path and path not in self.touched_files:
-                        self.touched_files.append(path)
-            elif item.get("type") == "commandExecution":
-                self.command_count += 1
-        elif method == "error":
-            error = params.get("error") or {}
-            # codex 0.144 puts willRetry at params level, next to the error;
-            # accept the nested spot too in case the shape moves.
-            if params.get("willRetry") or error.get("willRetry"):
-                self.set_state(activity=f"transient error, retrying: {str(error.get('message', ''))[:150]}")
-            else:
-                self.turn_error = error
-                self.set_state(activity=f"error: {str(error.get('message', ''))[:200]}")
-        elif method == "turn/completed":
+        if method == "turn/completed":
             self.final_turn = params.get("turn") or {}
             self.turn_done.set()
-        elif method == "account/rateLimits/updated":
-            limits = (params.get("rateLimits") or {})
-            primary = limits.get("primary") or {}
-            if primary.get("usedPercent") is not None:
-                self.set_state(quota={
-                    "used_percent": primary.get("usedPercent"),
-                    "window_mins": primary.get("windowDurationMins"),
-                    "plan": limits.get("planType"),
-                    "at": time.time(),
-                })
+
+        try:
+            self.events.write(json.dumps(msg) + "\n")
+        except OSError as exc:
+            try:
+                self.logline(f"failed to write notification event: {exc}")
+            except OSError:
+                pass
+
+        try:
+            if method == "turn/started" and not self.turn_id:
+                self.turn_id = (params.get("turn") or {}).get("id")
+                self.set_state(phase="running", turn_id=self.turn_id, activity="turn started")
+            elif method == "item/started":
+                item = params.get("item") or {}
+                desc = self.describe_item(item)
+                if desc:
+                    self.set_state(activity=desc)
+            elif method == "item/completed":
+                item = params.get("item") or {}
+                if item.get("type") == "agentMessage" and item.get("text"):
+                    self.last_agent_message = item["text"]
+                elif item.get("type") == "fileChange":
+                    for change in item.get("changes") or []:
+                        path = change.get("path")
+                        if path and path not in self.touched_files:
+                            self.touched_files.append(path)
+                elif item.get("type") == "commandExecution":
+                    self.command_count += 1
+            elif method == "error":
+                error = params.get("error") or {}
+                # codex 0.144 puts willRetry at params level, next to the error;
+                # accept the nested spot too in case the shape moves.
+                if params.get("willRetry") or error.get("willRetry"):
+                    self.set_state(activity=f"transient error, retrying: {str(error.get('message', ''))[:150]}")
+                else:
+                    self.turn_error = error
+                    self.set_state(activity=f"error: {str(error.get('message', ''))[:200]}")
+            elif method == "account/rateLimits/updated":
+                limits = (params.get("rateLimits") or {})
+                primary = limits.get("primary") or {}
+                if primary.get("usedPercent") is not None:
+                    self.set_state(quota={
+                        "used_percent": primary.get("usedPercent"),
+                        "window_mins": primary.get("windowDurationMins"),
+                        "plan": limits.get("planType"),
+                        "at": time.time(),
+                    })
+        except OSError as exc:
+            try:
+                self.logline(f"failed to update state for {method}: {exc}")
+            except OSError:
+                pass
 
     @staticmethod
     def describe_item(item: dict) -> str | None:

@@ -4,6 +4,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -11,6 +12,7 @@ import pytest
 
 from codexspin import cli, jobs
 from codexspin.appserver import AppServerClient, AppServerError
+from codexspin.runner import Runner
 
 FAKE = str(Path(__file__).parent / "fake_codex.py")
 FAKE_SSH = str(Path(__file__).parent / "fake_ssh.py")
@@ -640,23 +642,91 @@ def test_quota_window_formatting(capsys):
 # ---- communication layer ----
 
 def test_notification_handler_error_does_not_wedge_reader(monkeypatch):
-    """L3: a throwing notification handler must not kill the reader thread or
-    strand turn/completed (the silent-hang failure class)."""
+    """A throwing notification handler closes the client without hanging."""
     monkeypatch.setenv("CODEXSPIN_CODEX_BIN", FAKE)
     monkeypatch.setenv("FAKE_MODE", "ok")
     client = AppServerClient(cwd=".")
-    client.initialize()
-    client.notification_handler = lambda msg: (_ for _ in ()).throw(RuntimeError("disk full"))
-    r = client.request("thread/start", {"cwd": ".", "approvalPolicy": "never",
+    closed = threading.Event()
+    client.on_close = closed.set
+    try:
+        client.initialize()
+        client.notification_handler = lambda msg: (_ for _ in ()).throw(RuntimeError("disk full"))
+        client.request("thread/start", {"cwd": ".", "approvalPolicy": "never",
                                         "sandbox": "read-only", "serviceName": "x", "ephemeral": True})
-    tid = (r.get("thread") or {}).get("id")
-    # Must NOT raise/timeout despite the handler throwing on every notification.
-    client.request("turn/start", {"threadId": tid,
-                   "input": [{"type": "text", "text": "hi", "text_elements": []}],
-                   "model": None, "effort": None, "outputSchema": None}, timeout=15)
-    assert client._stdout_thread.is_alive()
-    assert any("handler error" in s for s in client.stderr_tail)
-    client.close()
+        assert closed.wait(timeout=3)
+        client._stdout_thread.join(timeout=3)
+        assert client.closed
+        assert not client._stdout_thread.is_alive()
+        assert any("handler error" in s for s in client.stderr_tail)
+    finally:
+        client.close()
+
+
+def test_turn_completed_handler_error_closes_and_unblocks(monkeypatch):
+    """A handler fault on the terminal notification still runs the close path."""
+    monkeypatch.setenv("CODEXSPIN_CODEX_BIN", FAKE)
+    monkeypatch.setenv("FAKE_MODE", "ok")
+    client = AppServerClient(cwd=".")
+    closed = threading.Event()
+    saw_completed = threading.Event()
+    client.on_close = closed.set
+
+    def handler(msg):
+        if msg.get("method") == "turn/completed":
+            saw_completed.set()
+            raise RuntimeError("terminal handler failed")
+
+    try:
+        client.initialize()
+        client.notification_handler = handler
+        r = client.request("thread/start", {"cwd": ".", "approvalPolicy": "never",
+                                            "sandbox": "read-only", "serviceName": "x",
+                                            "ephemeral": True})
+        tid = (r.get("thread") or {}).get("id")
+        client.request("turn/start", {"threadId": tid,
+                       "input": [{"type": "text", "text": "hi", "text_elements": []}],
+                       "model": None, "effort": None, "outputSchema": None}, timeout=15)
+        assert closed.wait(timeout=5)
+        assert saw_completed.is_set()
+        assert client.closed
+    finally:
+        client.close()
+
+
+def test_runner_notification_disk_errors_do_not_block_completion(tmp_path, monkeypatch):
+    job_path = tmp_path / "runner-job"
+    job_path.mkdir()
+    (job_path / "job.json").write_text("{}")
+    (job_path / "state.json").write_text("{}")
+    runner = Runner(job_path, resume=False)
+    runner.events.close()
+
+    class BrokenEvents:
+        def write(self, _line):
+            raise OSError("events disk full")
+
+    runner.events = BrokenEvents()
+
+    def fail_state(**_updates):
+        raise OSError("state disk full")
+
+    monkeypatch.setattr(runner, "set_state", fail_state)
+    try:
+        runner.on_notification({
+            "method": "turn/started",
+            "params": {"turn": {"id": "turn-1"}},
+        })
+        runner.on_notification({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn-1", "status": "completed"}},
+        })
+        assert runner.turn_done.is_set()
+        assert runner.final_turn == {"id": "turn-1", "status": "completed"}
+        log = (job_path / "runner.log").read_text()
+        assert "failed to write notification event: events disk full" in log
+        assert "failed to update state for turn/started: state disk full" in log
+    finally:
+        runner.log.close()
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
@@ -672,6 +742,66 @@ def test_send_after_process_death_raises_typed(monkeypatch):
     client.closed = False  # force the death-between-check-and-write window
     with pytest.raises(AppServerError):
         client.notify("initialized", {})
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_send_failure_wakes_pending_request(monkeypatch):
+    """A broken send wakes a request already waiting on the response condition."""
+    monkeypatch.setenv("CODEXSPIN_CODEX_BIN", FAKE)
+    client = AppServerClient(cwd=".")
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+    request_waiting = threading.Event()
+    request_finished = threading.Event()
+    request_errors = []
+
+    def blocking_handler(_msg):
+        handler_started.set()
+        release_handler.wait(timeout=15)
+
+    try:
+        client.initialize()
+        client.notification_handler = blocking_handler
+        client.request("thread/start", {"cwd": ".", "approvalPolicy": "never",
+                                        "sandbox": "read-only", "serviceName": "x",
+                                        "ephemeral": True})
+        assert handler_started.wait(timeout=3)
+
+        original_wait_for = client._response_cv.wait_for
+
+        def observed_wait_for(predicate, timeout=None):
+            request_waiting.set()
+            return original_wait_for(predicate, timeout=timeout)
+
+        monkeypatch.setattr(client._response_cv, "wait_for", observed_wait_for)
+
+        def wait_for_response():
+            try:
+                client.request("never/answered", {}, timeout=30)
+            except Exception as exc:  # noqa: BLE001 - asserted below
+                request_errors.append(exc)
+            finally:
+                request_finished.set()
+
+        waiter = threading.Thread(target=wait_for_response)
+        waiter.start()
+        assert request_waiting.wait(timeout=3)
+
+        client.proc.kill()
+        client.proc.wait(timeout=5)
+        client.closed = False  # force the death-between-check-and-write window
+        started = time.monotonic()
+        with pytest.raises(AppServerError):
+            client.notify("initialized", {})
+        assert request_finished.wait(timeout=5)
+        assert time.monotonic() - started < 5
+        assert len(request_errors) == 1
+        assert isinstance(request_errors[0], AppServerError)
+    finally:
+        release_handler.set()
+        if "waiter" in locals():
+            waiter.join(timeout=5)
+        client.close()
 
 
 def test_validate_host_rejects_option_injection():

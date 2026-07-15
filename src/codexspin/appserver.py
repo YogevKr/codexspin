@@ -121,8 +121,11 @@ class AppServerClient:
             except (BrokenPipeError, ValueError, OSError) as exc:
                 # The app-server died between our closed-check and this write.
                 # Surface it as a typed error so callers (the runner) fail
-                # cleanly instead of crashing on an OSError.
-                self.closed = True
+                # cleanly instead of crashing on an OSError. Wake any other
+                # requests already waiting for responses from the dead process.
+                with self._response_cv:
+                    self.closed = True
+                    self._response_cv.notify_all()
                 raise AppServerError(f"app-server connection lost: {exc}") from exc
 
     def _read_stdout(self) -> None:
@@ -147,14 +150,11 @@ class AppServerClient:
                     self._responses[msg["id"]] = msg
                     self._response_cv.notify_all()
             elif "method" in msg and self.notification_handler:
-                # A handler that raises (e.g. a transient disk error in the
-                # runner's set_state) must NOT kill this reader thread — that
-                # would strand turn/completed and hang the turn forever. Record
-                # and keep reading so terminal notifications still arrive.
                 try:
                     self.notification_handler(msg)
-                except Exception as exc:  # noqa: BLE001 — reader must survive any handler fault
+                except Exception as exc:  # noqa: BLE001 — handler faults close the client cleanly
                     self.stderr_tail.append(f"[notification handler error] {exc}")
+                    break
         self.closed = True
         with self._response_cv:
             self._response_cv.notify_all()
