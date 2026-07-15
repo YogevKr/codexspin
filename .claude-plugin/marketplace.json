@@ -1,0 +1,15 @@
+{
+  "name": "codexspin",
+  "description": "Parallel Codex session management for Claude Code: delegation skill + background-job visibility.",
+  "owner": {
+    "name": "Yogev Kriger",
+    "url": "https://github.com/YogevKr"
+  },
+  "plugins": [
+    {
+      "name": "codexspin",
+      "source": "./",
+      "description": "Codex delegation skill + session-start visibility for codexspin background jobs. Requires the codexspin CLI (brew install yogevkr/tap/codexspin)."
+    }
+  ]
+}

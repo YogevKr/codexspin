@@ -126,10 +126,19 @@ during startup, default 180).
 
 ## Claude Code skill
 
-`skills/codex/SKILL.md` is a Claude Code skill covering how to drive codex as
-a second agent — review discipline, delegation prompting, sandbox choices, and
-codexspin routing (including known failure modes and their recoveries). To use
-it, symlink it into your user skills:
+This repo is also a Claude Code plugin: the `skills/codex` skill (how to
+drive codex as a second agent — review discipline, delegation prompting,
+sandbox choices, codexspin routing, failure-mode recoveries) plus a
+SessionStart hook that lists running/recently-finished codexspin jobs at the
+top of every session, so detached fleets are never forgotten.
+
+```sh
+claude plugin marketplace add YogevKr/codexspin
+claude plugin install codexspin@codexspin
+```
+
+Prefer just the skill without hooks? Symlink it instead (don't do both, or
+the skill loads twice):
 
 ```sh
 ln -s "$(pwd)/skills/codex" ~/.claude/skills/codex
