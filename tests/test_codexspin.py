@@ -890,3 +890,29 @@ def test_remote_nonprompt_does_not_consume_stdin(tmp_path, monkeypatch):
         os.close(old)
         os.close(r)
     assert bytes_file.read_text().strip() == "0"
+
+
+def test_doctor_warns_on_codex_version_drift(capsys, monkeypatch, tmp_path):
+    # Fake codex reporting a different minor than the tested baseline.
+    fake = tmp_path / "fake-codex-vers.py"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, json\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('codex-cli 0.199.0'); sys.exit(0)\n"
+        "sys.exit(0)\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("CODEXSPIN_CODEX_BIN", str(fake))
+    # doctor will fail at app-server (fake has no app-server), but the version
+    # warning prints before that.
+    cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert "0.199" in out
+    assert "may have drifted" in out
+
+
+def test_codex_minor_parsing():
+    assert cli._codex_minor("codex-cli 0.144.1") == "0.144"
+    assert cli._codex_minor("codex-cli 0.199.0 (x)") == "0.199"
+    assert cli._codex_minor("garbage") is None

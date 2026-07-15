@@ -21,6 +21,7 @@ import fcntl
 import shlex
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -151,6 +152,15 @@ _HANDOFF_PROMPT = (
     "You were handed off to another machine mid-task. "
     "Re-read your prior context and continue to completion."
 )
+
+# codexspin's app-server JSON-RPC assumptions were verified against this
+# codex-cli minor. A different minor may have drifted the protocol shapes.
+TESTED_CODEX_MINOR = "0.144"
+
+
+def _codex_minor(version_output: str) -> str | None:
+    m = re.search(r"(\d+)\.(\d+)", version_output)
+    return f"{m.group(1)}.{m.group(2)}" if m else None
 
 
 def launch_runner(jd: Path, resume: bool = False) -> int:
@@ -763,6 +773,11 @@ def cmd_doctor(args) -> int:
         print(f"codex binary: FAILED — {version.stderr.strip() or version.stdout.strip()}")
         return 1
     print(f"codex binary: {version.stdout.strip()}")
+    minor = _codex_minor(version.stdout)
+    if minor and minor != TESTED_CODEX_MINOR:
+        print(f"⚠ codexspin verified against codex {TESTED_CODEX_MINOR}.x; yours is "
+              f"{minor}.x — app-server protocol shapes may have drifted, watch for "
+              f"job failures and file an issue if so")
     try:
         client = AppServerClient(cwd=os.getcwd())
         client.initialize()
