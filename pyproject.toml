@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Spin and manage parallel Codex sessions via the codex app-server: spawn / status / result / await / send / cancel, with all three sandbox modes."
 requires-python = ">=3.11"
 dependencies = []
+license = {file = "LICENSE"}
 
 [project.scripts]
 codexspin = "codexspin.cli:main"
