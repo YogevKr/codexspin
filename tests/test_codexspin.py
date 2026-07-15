@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -45,6 +46,18 @@ def wait_terminal(job_id: str, timeout: float = 15) -> dict:
             return state
         time.sleep(0.1)
     raise AssertionError(f"job {job_id} never reached a terminal phase: {jobs.load_state(job_id)}")
+
+
+def wait_running_with_events(job_id: str, timeout: float = 10) -> Path:
+    events_path = jobs.job_dir(job_id) / "events.jsonl"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = jobs.load_state(job_id) or {}
+        if state.get("phase") == "running" and events_path.exists():
+            if events_path.read_text().splitlines():
+                return events_path
+        time.sleep(0.1)
+    raise AssertionError(f"job {job_id} never ran with events: {jobs.load_state(job_id)}")
 
 
 def wait_remote_terminal(remote_home: Path, job_id: str, timeout: float = 15) -> dict:
@@ -226,6 +239,46 @@ def test_cancel(capsys, monkeypatch):
     assert rc == 0
     state = wait_terminal(job_id)
     assert state["phase"] == "cancelled"
+
+
+def test_running_status_shows_recent_heartbeat(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "slow")
+    job_id = spawn(capsys)
+    try:
+        wait_running_with_events(job_id)
+        cli.main(["status", job_id])
+        out = capsys.readouterr().out
+        match = re.search(r"heartbeat: last event (\d+)s ago · (\d+) events", out)
+        assert match
+        assert int(match.group(1)) < cli.STALE_SECONDS
+        assert int(match.group(2)) > 0
+    finally:
+        cli.main(["cancel", job_id])
+        wait_terminal(job_id)
+
+
+def test_running_status_warns_when_heartbeat_is_quiet(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "slow")
+    job_id = spawn(capsys)
+    try:
+        events_path = wait_running_with_events(job_id)
+        stale_time = time.time() - cli.STALE_SECONDS - 60
+        os.utime(events_path, (stale_time, stale_time))
+        cli.main(["status", job_id])
+        out = capsys.readouterr().out
+        assert "⚠ quiet" in out
+        assert "last event" in out
+    finally:
+        cli.main(["cancel", job_id])
+        wait_terminal(job_id)
+
+
+def test_failed_status_shows_reason_inline(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "fail")
+    job_id = spawn(capsys)
+    assert wait_terminal(job_id)["phase"] == "failed"
+    cli.main(["status", job_id])
+    assert "reason: fake model exploded" in capsys.readouterr().out
 
 
 def test_send_resumes_thread(capsys):

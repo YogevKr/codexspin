@@ -282,6 +282,39 @@ PHASE_GLYPH = {
     "failed": ("✗", "red"), "cancelled": ("■", "gray"), "died": ("☠", "red"),
     "timeout": ("⏱", "yellow"),
 }
+STALE_SECONDS = 180
+
+
+def _heartbeat_line(job_id: str, now: float | None = None) -> tuple[str, bool]:
+    events_path = job_dir(job_id) / "events.jsonl"
+    try:
+        with events_path.open("rb") as events_file:
+            event_count = sum(1 for _ in events_file)
+            mtime = os.fstat(events_file.fileno()).st_mtime
+    except OSError:
+        return "heartbeat: no events yet", False
+    if not event_count:
+        return "heartbeat: no events yet", False
+
+    age = int(max(0, (now if now is not None else time.time()) - mtime))
+    if age > STALE_SECONDS:
+        quiet_age = f"{age // 60}m" if age < 3600 else f"{age // 3600}h"
+        return (f"⚠ quiet {quiet_age} — last event {age}s ago · "
+                f"{event_count} events"), True
+    return f"heartbeat: last event {age}s ago · {event_count} events", False
+
+
+def _terminal_reason(s: dict) -> str:
+    result = read_json(job_dir(s["job_id"]) / "result.json") or {}
+    error = result.get("error") or {}
+    message = error.get("message") if isinstance(error, dict) else None
+    return " ".join(str(message or s.get("activity") or "unknown").split())
+
+
+def _truncate_line(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text
+    return text[:max(0, width - 1)] + "…"
 
 
 def styled_sandbox(st: Style, sandbox: str) -> str:
@@ -328,6 +361,12 @@ def print_job_fancy(st: Style, s: dict, width: int) -> None:
     print(f"  {st.dim(s.get('prompt_preview', '')[:width - 4])}")
     if not finished:
         print(f"  {st.cyan('↳ ' + str(s.get('activity', ''))[:width - 6])}")
+        heartbeat, stale = _heartbeat_line(s["job_id"])
+        heartbeat = _truncate_line(heartbeat, width - 2)
+        print(f"  {(st.yellow if stale else st.dim)(heartbeat)}")
+    elif phase != "done":
+        reason = _truncate_line(f"reason: {_terminal_reason(s)}", width - 2)
+        print(f"  {paint(reason)}")
     meta = []
     if s.get("branch"):
         meta.append(f"branch {s['branch']}")
@@ -338,7 +377,7 @@ def print_job_fancy(st: Style, s: dict, width: int) -> None:
     print()
 
 
-def print_job_plain(s: dict) -> None:
+def print_job_plain(s: dict, width: int = 120) -> None:
     started = s.get("started_at") or 0
     end = s.get("finished_at") or time.time()
     line = (
@@ -351,6 +390,11 @@ def print_job_plain(s: dict) -> None:
     print(f"  {s.get('prompt_preview', '')}")
     if s.get("phase") not in TERMINAL_PHASES:
         print(f"  ↳ {s.get('activity', '')}")
+        heartbeat, _ = _heartbeat_line(s["job_id"])
+        print(f"  {_truncate_line(heartbeat, width - 2)}")
+    elif s.get("phase") != "done":
+        reason = _truncate_line(f"reason: {_terminal_reason(s)}", width - 2)
+        print(f"  {reason}")
     if s.get("branch"):
         print(f"  branch: {s['branch']}  worktree: {s.get('worktree', '')}")
     if s.get("thread_id"):
@@ -380,7 +424,7 @@ def cmd_status(args) -> int:
         if fancy:
             print_job_fancy(st, s, width)
         else:
-            print_job_plain(s)
+            print_job_plain(s, width)
         q = s.get("quota")
         if q and (quota is None or (q.get("at") or 0) > (quota.get("at") or 0)):
             quota = q
