@@ -14,7 +14,9 @@ must bind localhost, run dev servers, or fetch the network.
 ## Install
 
 ```sh
-uv tool install --editable ~/projects/codexspin
+uv tool install git+https://github.com/YogevKr/codexspin
+# or, from a clone, for development:
+uv tool install --editable .
 ```
 
 Requires `codex` on PATH, already authenticated (`codex login`).
