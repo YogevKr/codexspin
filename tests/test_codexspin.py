@@ -206,6 +206,29 @@ def test_spawn_completes_and_result(capsys):
     assert result["touched_files"] == ["src/example.py"]
 
 
+def test_subagent_turn_does_not_end_the_job(capsys, monkeypatch):
+    """A delegated sub-agent finishing must not terminate the job.
+
+    Regression: the runner ended on the first turn/completed from ANY thread.
+    Codex sub-agents run as their own threads over the same connection, so a
+    sub-agent being interrupted marked the job failed — and a sub-agent merely
+    finishing marked it done — while the real turn was still working, tearing
+    the app-server down mid-run.
+    """
+    monkeypatch.setenv("FAKE_MODE", "subagent")
+    job_id = spawn(capsys)
+    state = wait_terminal(job_id)
+    assert state["phase"] == "done"
+    assert state["turn_id"] == "fake-turn-0001"
+
+    result = json.loads((jobs.job_dir(job_id) / "result.json").read_text())
+    # The job's own final answer, not the sub-agent's report to its caller.
+    assert result["final_message"] == "FAKE-DONE"
+    # The main turn ran to completion instead of being cut short.
+    assert result["touched_files"] == ["src/example.py"]
+    assert result["error"] is None
+
+
 def test_failed_turn(capsys, monkeypatch):
     monkeypatch.setenv("FAKE_MODE", "fail")
     job_id = spawn(capsys)

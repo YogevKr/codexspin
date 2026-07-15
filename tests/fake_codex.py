@@ -8,11 +8,14 @@ Selected behavior via FAKE_MODE env var:
   hang     never answers thread/start
   die      answers turn/start, then the whole server exits mid-turn
   retryerr emits a willRetry error notification, then completes normally
+  subagent a delegated sub-agent thread runs and is interrupted mid-turn,
+           then the job's own thread does its work and completes normally
 """
 import json
 import os
 import sys
 import threading
+import time
 
 MODE = os.environ.get("FAKE_MODE", "ok")
 ARGV_FILE = os.environ.get("FAKE_CODEX_ARGV_FILE")
@@ -21,6 +24,8 @@ if ARGV_FILE:
         json.dump(sys.argv[1:], fh)
 THREAD_ID = "fake-thread-0001"
 TURN_ID = "fake-turn-0001"
+SUB_THREAD_ID = "fake-subthread-0001"
+SUB_TURN_ID = "fake-subturn-0001"
 interrupted = threading.Event()
 
 
@@ -44,6 +49,23 @@ def run_turn():
     if MODE == "retryerr":
         # real 0.144 shape: willRetry sits at params level, next to the error
         notify("error", {"error": {"message": "transient stream error"}, "willRetry": True})
+    if MODE == "subagent":
+        # A delegated sub-agent: its own thread, its own turn lifecycle, all
+        # multiplexed over this one connection. It ends before the main turn
+        # has produced anything — the job must not end with it.
+        notify("turn/started", {"threadId": SUB_THREAD_ID,
+                                "turn": {"id": SUB_TURN_ID, "status": "inProgress"}})
+        notify("item/completed", {"threadId": SUB_THREAD_ID, "turnId": SUB_TURN_ID,
+                                  "item": {"type": "agentMessage", "id": "s1",
+                                           "text": "SUB-AGENT-NOISE"}})
+        notify("error", {"threadId": SUB_THREAD_ID, "error": {"message": "sub-agent hiccup"}})
+        notify("turn/completed", {"threadId": SUB_THREAD_ID,
+                                  "turn": {"id": SUB_TURN_ID, "status": "interrupted",
+                                           "error": None}})
+        # The real gap: the main agent keeps working for minutes after a
+        # sub-agent ends. Without it the runner races on to the main turn's
+        # own completion and the bug hides.
+        time.sleep(2)
     if MODE == "slow":
         if interrupted.wait(timeout=20):
             notify("turn/completed", {"threadId": THREAD_ID,

@@ -54,10 +54,22 @@ class Runner:
             self.state.update(updates, updated_at=time.time(), event_count=self.event_count)
             write_json(self.dir / "state.json", dict(self.state))
 
+    def is_own_thread(self, params: dict) -> bool:
+        """Whether a notification speaks for this job.
+
+        Codex runs delegated sub-agents as separate threads whose turn and item
+        lifecycles are multiplexed over this same connection. Only the job's own
+        thread ends the job or supplies its answer — a sub-agent finishing (or
+        being interrupted) says nothing about the main turn. A payload carrying
+        no threadId is treated as ours.
+        """
+        thread_id = params.get("threadId")
+        return thread_id is None or thread_id == self.thread_id
+
     def on_notification(self, msg: dict) -> None:
         method = msg.get("method")
         params = msg.get("params", {})
-        if method == "turn/completed":
+        if method == "turn/completed" and self.is_own_thread(params):
             self.final_turn = params.get("turn") or {}
             self.turn_done.set()
 
@@ -71,7 +83,7 @@ class Runner:
                 pass
 
         try:
-            if method == "turn/started" and not self.turn_id:
+            if method == "turn/started" and not self.turn_id and self.is_own_thread(params):
                 self.turn_id = (params.get("turn") or {}).get("id")
                 self.set_state(phase="running", turn_id=self.turn_id, activity="turn started")
             elif method == "item/started":
@@ -82,8 +94,12 @@ class Runner:
             elif method == "item/completed":
                 item = params.get("item") or {}
                 if item.get("type") == "agentMessage" and item.get("text"):
-                    self.last_agent_message = item["text"]
+                    # A sub-agent's report to its caller is not the job's answer.
+                    if self.is_own_thread(params):
+                        self.last_agent_message = item["text"]
                 elif item.get("type") == "fileChange":
+                    # Deliberately unfiltered by thread: a sub-agent's edits and
+                    # commands land in the job's own tree, so they are the job's.
                     for change in item.get("changes") or []:
                         # A move/rename reports the OLD path plus kind.move_path
                         # for the new one; record the destination the user will
@@ -102,7 +118,10 @@ class Runner:
                 if params.get("willRetry") or error.get("willRetry"):
                     self.set_state(activity=f"transient error, retrying: {str(error.get('message', ''))[:150]}")
                 else:
-                    self.turn_error = error
+                    # Surface any thread's error as activity, but only our own
+                    # can fail the job — the main agent may handle a sub-agent's.
+                    if self.is_own_thread(params):
+                        self.turn_error = error
                     self.set_state(activity=f"error: {str(error.get('message', ''))[:200]}")
             elif method == "account/rateLimits/updated":
                 limits = (params.get("rateLimits") or {})
