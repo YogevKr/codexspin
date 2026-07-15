@@ -46,13 +46,19 @@ raising `--effort`.
 - **Anti-patterns:** vague framing ("take a look"), no output contract ("report
   back"), "think harder" in place of a contract, mixing jobs in one run, and
   demanding certainty the evidence can't support.
-- **Recon-instead-of-code failure mode (codex 0.144 collab):** implementation
-  tasks can come back as "investigation complete, recommendations sent to the
-  parent agent" with zero files changed — codex spawned read-only sub-agents
-  and stopped at a plan. Prevent it by stating in the prompt: "Do NOT spawn
-  sub-agents or delegate; implement it yourself; done only when tests pass and
-  the work is committed." Recovery on a warm thread: `codexspin send <job>
-  "Good recon — now IMPLEMENT it. ..."` (restate the contract).
+- **State a done-contract:** "done only when the build passes, the tests pass,
+  and the work is committed; final message must include `git diff --stat`."
+  Codex delegates freely to sub-agents — that is normal and fine; what you are
+  pinning down is the finish line, not the method.
+- **"Recon instead of code" was our bug, not codex's** (fixed 2026-07-15). If a
+  job reports `done` with zero files changed and a final message that reads like
+  a sub-agent talking to its caller ("recommendations sent to the parent agent",
+  "test map delivered to parent"), or reports `failed: turn status: interrupted`
+  right after real work, you are on a codexspin older than that fix: it ended
+  the job on the first `turn/completed` from *any* thread, so the first recon
+  sub-agent to return killed the run before the main agent implemented anything.
+  Upgrade rather than prompting around it — and re-read old job records with
+  suspicion; their phases and final messages may belong to a sub-agent.
 
 ## Review — proactive
 
