@@ -153,8 +153,14 @@ Verified against codex-cli 0.144 (July 2026).
    it), self-authored prompt, diff review after. `-m/--model -e/--effort`
    override config defaults; `status` shows the resolved model and current
    ChatGPT quota burn — check it before spawning a large fleet.
-2. `codexspin await <job> [<job>...]` as a background Bash task — blocks until
-   done and prints each result (final message, touched files). No polling.
+2. `codexspin await <job> [<job>...]` as a background Bash task — a
+   busy-waiting shell that blocks until done and prints each result (final
+   message, touched files); the task notification wakes you when it exits.
+   Never poll `status` in a loop yourself. Foreground `await` only for jobs
+   expected to finish inside the Bash tool timeout (~10 min) — the timeout
+   kills your wait, not the job. Rare niche: to react per-job as a large
+   fleet lands (rather than when the whole await exits), wrap `await` in a
+   Monitor and let its per-job result lines stream as events.
 3. `codexspin status` — live phase + current activity per job;
    `codexspin logs <job>` for the event tail; `codexspin cancel <job>` to
    interrupt (`--hard` kills the process group).
