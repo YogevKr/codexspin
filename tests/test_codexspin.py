@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from codexspin import cli, jobs
+from codexspin.appserver import AppServerClient, AppServerError
 
 FAKE = str(Path(__file__).parent / "fake_codex.py")
 FAKE_SSH = str(Path(__file__).parent / "fake_ssh.py")
@@ -634,3 +635,75 @@ def test_quota_window_formatting(capsys):
     state_path.write_text(json.dumps(state))
     cli.main(["status", job_id])
     assert "12% of 5h window" in capsys.readouterr().out
+
+
+# ---- communication layer ----
+
+def test_notification_handler_error_does_not_wedge_reader(monkeypatch):
+    """L3: a throwing notification handler must not kill the reader thread or
+    strand turn/completed (the silent-hang failure class)."""
+    monkeypatch.setenv("CODEXSPIN_CODEX_BIN", FAKE)
+    monkeypatch.setenv("FAKE_MODE", "ok")
+    client = AppServerClient(cwd=".")
+    client.initialize()
+    client.notification_handler = lambda msg: (_ for _ in ()).throw(RuntimeError("disk full"))
+    r = client.request("thread/start", {"cwd": ".", "approvalPolicy": "never",
+                                        "sandbox": "read-only", "serviceName": "x", "ephemeral": True})
+    tid = (r.get("thread") or {}).get("id")
+    # Must NOT raise/timeout despite the handler throwing on every notification.
+    client.request("turn/start", {"threadId": tid,
+                   "input": [{"type": "text", "text": "hi", "text_elements": []}],
+                   "model": None, "effort": None, "outputSchema": None}, timeout=15)
+    assert client._stdout_thread.is_alive()
+    assert any("handler error" in s for s in client.stderr_tail)
+    client.close()
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_send_after_process_death_raises_typed(monkeypatch):
+    """L1: a write to a dead app-server surfaces as AppServerError, not a bare
+    OSError that would crash the runner before writing result.json."""
+    monkeypatch.setenv("CODEXSPIN_CODEX_BIN", FAKE)
+    client = AppServerClient(cwd=".")
+    client.initialize()
+    client.proc.kill()
+    client.proc.wait()
+    time.sleep(0.2)
+    client.closed = False  # force the death-between-check-and-write window
+    with pytest.raises(AppServerError):
+        client.notify("initialized", {})
+
+
+def test_validate_host_rejects_option_injection():
+    """R9: a host starting with '-' would become an ssh/rsync option."""
+    for bad in ["-oProxyCommand=id", "--", "-lroot", ""]:
+        with pytest.raises(SystemExit, match="invalid host"):
+            cli.validate_host(bad)
+    assert cli.validate_host("tmm") == "tmm"
+
+
+def test_remote_host_equals_form_rejected(capsys):
+    with pytest.raises(SystemExit, match="invalid host"):
+        cli.main(["status", "--host=-oProxyCommand=echo pwned"])
+
+
+def test_remote_nonprompt_does_not_consume_stdin(tmp_path, monkeypatch):
+    """R3: a non-prompt remote command must not let ssh swallow caller stdin."""
+    spy = tmp_path / "spyssh.sh"
+    bytes_file = tmp_path / "bytes"
+    spy.write_text("#!/bin/bash\ncat | wc -c | tr -d ' ' > \"$SPY_BYTES\"\nexit 0\n")
+    spy.chmod(0o755)
+    monkeypatch.setenv("CODEXSPIN_SSH_BIN", str(spy))
+    monkeypatch.setenv("SPY_BYTES", str(bytes_file))
+    r, w = os.pipe()
+    os.write(w, b"SENTINEL-CALLER-STDIN\n")
+    os.close(w)
+    old = os.dup(0)
+    os.dup2(r, 0)
+    try:
+        cli.main(["status", "--host", "tmm"])
+    finally:
+        os.dup2(old, 0)
+        os.close(old)
+        os.close(r)
+    assert bytes_file.read_text().strip() == "0"

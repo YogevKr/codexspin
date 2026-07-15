@@ -90,10 +90,19 @@ def _forwarded_argv(argv: list[str], prompt_index: int | None) -> list[str]:
     return forwarded
 
 
+def validate_host(host: str) -> str:
+    """Reject hosts that ssh/rsync would parse as an option (e.g.
+    -oProxyCommand=…) — argument injection into the transport."""
+    if not host or host.startswith("-"):
+        raise SystemExit(f"codexspin: invalid host {host!r} (must not start with '-')")
+    return host
+
+
 def _run_remote(args, argv: list[str]) -> int:
     command_name = str(args.cmd)
     if command_name not in _REMOTE_COMMANDS:
         raise SystemExit(f"codexspin: --host is not supported for {command_name}")
+    host = validate_host(str(args.remote_host))
 
     prompt = None
     prompt_index = None
@@ -103,10 +112,12 @@ def _run_remote(args, argv: list[str]) -> int:
 
     forwarded = _forwarded_argv(argv, prompt_index)
     ssh_bin = os.environ.get("CODEXSPIN_SSH_BIN", "ssh")
-    command = [ssh_bin, str(args.remote_host), _remote_command(["codexspin", *forwarded])]
+    command = [ssh_bin, host, _remote_command(["codexspin", *forwarded])]
     try:
         if prompt is None:
-            completed = subprocess.run(command)
+            # DEVNULL, not inherited: ssh must not swallow the caller's stdin
+            # (e.g. a shell loop feeding lines to `codexspin await --host`).
+            completed = subprocess.run(command, stdin=subprocess.DEVNULL)
         else:
             completed = subprocess.run(command, input=prompt, text=True)
     except FileNotFoundError:
@@ -473,7 +484,11 @@ def find_session_rollout(thread_id: str) -> Path:
 
 def run_handoff_command(command: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(command, input=input_text, capture_output=True, text=True)
+        # With no input_text, force DEVNULL so ssh/rsync never inherit and
+        # consume the caller's stdin.
+        stdin = None if input_text is not None else subprocess.DEVNULL
+        return subprocess.run(command, input=input_text, stdin=stdin,
+                              capture_output=True, text=True)
     except OSError as exc:
         raise SystemExit(f"codexspin: cannot run {command[0]}: {exc}") from exc
 
@@ -502,6 +517,7 @@ def cmd_handoff(args) -> int:
 
 
 def _handoff_locked(args, job_id: str) -> int:
+    validate_host(args.host)
     state = load_state(job_id)
     if state is None:
         raise SystemExit(f"codexspin: cannot read state for {job_id}")
