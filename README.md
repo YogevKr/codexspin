@@ -38,12 +38,12 @@ codexspin status              # running + last 24h (--all for everything)
 codexspin run "..."          # foreground: spawn + wait + print (one job you'll watch)
 codexspin await JOB [JOB...]  # block until done, print results
 codexspin result JOB [--json]
-codexspin send JOB "follow-up on the same codex thread"
+codexspin send JOB "..." [--wait]   # follow-up on the warm thread (--wait blocks + prints)
 codexspin handoff JOB HOST ["continue on the remote"]
 codexspin cancel JOB [--hard]
 codexspin logs JOB
 codexspin doctor              # codex binary / app-server / auth / defaults
-codexspin gc --keep-days 7
+codexspin gc [JOB…]           # this project by default; JOB ids or --everywhere to widen; --dry-run
 ```
 
 ## Remote hosts

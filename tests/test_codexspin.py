@@ -944,3 +944,73 @@ def test_run_timeout_leaves_job_running(capsys, monkeypatch):
     assert rc == 2
     err = capsys.readouterr().err
     assert "still running after" in err
+
+
+# ---- review-fix regressions ----
+
+def test_gc_explicit_and_dry_run_and_scoping(capsys, tmp_path, monkeypatch):
+    # Sibling dirs: a bare gc in `here` must not sweep a job whose cwd is `there`.
+    here = tmp_path / "here"; here.mkdir()
+    there = tmp_path / "there"; there.mkdir()
+    monkeypatch.chdir(here)
+    a = spawn(capsys, "-n", "here")            # cwd = here
+    b_rc = cli.main(["spawn", "-C", str(there), "-n", "elsewhere", "do it"])
+    assert b_rc == 0
+    b = capsys.readouterr().out.strip().splitlines()[-1]
+    wait_terminal(a); wait_terminal(b)
+
+    # dry-run removes nothing
+    cli.main(["gc", "--keep-days", "0", "--dry-run"])
+    assert "would be removed" in capsys.readouterr().out
+    assert jobs.job_dir(a).is_dir() and jobs.job_dir(b).is_dir()
+
+    # bare sweep here removes only the here-job, not the elsewhere-job
+    cli.main(["gc", "--keep-days", "0"])
+    capsys.readouterr()
+    assert not jobs.job_dir(a).is_dir()
+    assert jobs.job_dir(b).is_dir()          # protected: different project
+
+    # explicit id removes the elsewhere-job regardless of scope
+    cli.main(["gc", b])
+    capsys.readouterr()
+    assert not jobs.job_dir(b).is_dir()
+
+
+def test_gc_everywhere_sweeps_all(capsys, tmp_path):
+    other = tmp_path / "elsewhere"; other.mkdir()
+    cli.main(["spawn", "-C", str(other), "-n", "far", "do it"])
+    job = capsys.readouterr().out.strip().splitlines()[-1]
+    wait_terminal(job)
+    cli.main(["gc", "--keep-days", "0", "--everywhere"])
+    capsys.readouterr()
+    assert not jobs.job_dir(job).is_dir()
+
+
+def test_touched_files_uses_move_path(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "move")
+    job_id = spawn(capsys)
+    wait_terminal(job_id)
+    result = json.loads((jobs.job_dir(job_id) / "result.json").read_text())
+    assert result["touched_files"] == ["new.txt"]   # not the old "old.txt"
+
+
+def test_logs_readable_and_json(capsys):
+    job_id = spawn(capsys)
+    wait_terminal(job_id)
+    cli.main(["logs", job_id])
+    out = capsys.readouterr().out
+    assert "« FAKE-DONE" in out            # agent text rendered
+    assert "± src/example.py" in out       # file change rendered
+    assert "threadId" not in out           # no raw id-laden JSON
+    cli.main(["logs", job_id, "--json"])
+    raw = capsys.readouterr().out
+    assert '"method"' in raw and "threadId" in raw
+
+
+def test_send_wait_blocks_and_prints(capsys):
+    job_id = spawn(capsys)
+    wait_terminal(job_id)
+    rc = cli.main(["send", job_id, "again", "--wait"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "FAKE-DONE" in out              # printed the result inline, no separate await

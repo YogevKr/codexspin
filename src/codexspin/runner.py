@@ -85,7 +85,12 @@ class Runner:
                     self.last_agent_message = item["text"]
                 elif item.get("type") == "fileChange":
                     for change in item.get("changes") or []:
-                        path = change.get("path")
+                        # A move/rename reports the OLD path plus kind.move_path
+                        # for the new one; record the destination the user will
+                        # actually find on disk.
+                        kind = change.get("kind")
+                        dest = kind.get("move_path") if isinstance(kind, dict) else None
+                        path = dest or change.get("path")
                         if path and path not in self.touched_files:
                             self.touched_files.append(path)
                 elif item.get("type") == "commandExecution":

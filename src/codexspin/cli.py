@@ -267,19 +267,17 @@ def cmd_spawn(args) -> int:
     return 0
 
 
-def cmd_run(args) -> int:
-    """spawn + await + result in one foreground command. The job is still
+def _await_and_print(job_id: str, json_out: bool, timeout: float | None) -> int:
+    """Block until a job is terminal, then print its result. The job stays
     detached: Ctrl-C or a timeout leaves it running to re-attach later."""
-    job_id = _create_job(args)
-    print(f"codexspin: running {job_id}", file=sys.stderr)
-    deadline = time.time() + args.timeout if args.timeout else None
+    deadline = time.time() + timeout if timeout else None
     try:
         while True:
             state = load_state(job_id) or {}
             if state.get("phase") in TERMINAL_PHASES:
                 break
             if deadline and time.time() > deadline:
-                print(f"codexspin: {job_id} still running after {args.timeout}s — job continues; "
+                print(f"codexspin: {job_id} still running after {timeout}s — job continues; "
                       f"`codexspin await {job_id}`", file=sys.stderr)
                 return 2
             time.sleep(0.5)
@@ -288,7 +286,14 @@ def cmd_run(args) -> int:
               f"(`codexspin await {job_id}` to re-attach, `codexspin cancel {job_id}` to stop)",
               file=sys.stderr)
         return 130
-    return cmd_result(argparse.Namespace(job=job_id, json=args.json))
+    return cmd_result(argparse.Namespace(job=job_id, json=json_out))
+
+
+def cmd_run(args) -> int:
+    """spawn + await + result in one foreground command."""
+    job_id = _create_job(args)
+    print(f"codexspin: running {job_id}", file=sys.stderr)
+    return _await_and_print(job_id, args.json, args.timeout)
 
 
 def use_color() -> bool:
@@ -562,7 +567,12 @@ def cmd_send(args) -> int:
         pid = launch_runner(jd, resume=True)
         state["runner_pid"] = pid
         write_json(jd / "state.json", state)
+    if getattr(args, "wait", False):
+        print(f"codexspin: resuming {job_id}", file=sys.stderr)
+        return _await_and_print(job_id, getattr(args, "json", False), getattr(args, "timeout", None))
     print(job_id)
+    print(f"codexspin: {job_id} resumed (async) — `codexspin await {job_id}` for the result, "
+          f"or use `send --wait`", file=sys.stderr)
     return 0
 
 
@@ -734,26 +744,61 @@ def cmd_cancel(args) -> int:
     return 0
 
 
+def _describe_event(msg: dict) -> str | None:
+    """A human line for one event — the actual content, not the id-laden JSON.
+    Returns None for events not worth showing in the readable log."""
+    method = msg.get("method", "")
+    p = msg.get("params") or {}
+    if "outputDelta" in method:
+        chunk = p.get("delta") or p.get("chunk") or p.get("text") or p.get("output") or ""
+        chunk = chunk.rstrip("\n")
+        return f"  ┆ {chunk}" if chunk else None
+    item = p.get("item") or {}
+    kind = item.get("type")
+    if method == "item/started" and kind == "commandExecution":
+        return f"$ {str(item.get('command', '')).strip()}"
+    if method == "item/completed":
+        if kind == "commandExecution":
+            return f"↳ exit {item.get('exitCode', '?')}"
+        if kind == "agentMessage" and item.get("text"):
+            return f"« {item['text'].strip()}"
+        if kind == "fileChange":
+            paths = []
+            for c in item.get("changes") or []:
+                k = c.get("kind")
+                paths.append((k.get("move_path") if isinstance(k, dict) else None) or c.get("path") or "?")
+            return f"± {', '.join(paths)}" if paths else None
+        if kind == "webSearch":
+            return f"web: {item.get('query', '')}"
+        if kind == "mcpToolCall":
+            return f"mcp: {item.get('server', '')}.{item.get('tool', '')}"
+    if method == "turn/started":
+        return "— turn started"
+    if method == "turn/completed":
+        return f"— turn {(p.get('turn') or {}).get('status', 'completed')}"
+    if method == "error":
+        return f"! error: {(p.get('error') or {}).get('message', '')[:200]}"
+    return None
+
+
 def cmd_logs(args) -> int:
     job_id = resolve_job_id(args.job)
-    jd = job_dir(job_id)
-    events = (jd / "events.jsonl")
+    events = job_dir(job_id) / "events.jsonl"
     if not events.exists():
         print("(no events yet)")
         return 0
     lines = events.read_text().splitlines()[-args.lines:]
     for line in lines:
+        if args.json:
+            print(line)
+            continue
         try:
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
-        method = msg.get("method", "?")
-        params = msg.get("params", {})
-        item = params.get("item") or {}
-        if method in ("item/started", "item/completed"):
-            print(f"{method:16s} {item.get('type', ''):18s} {json.dumps(item)[:140]}")
-        else:
-            print(f"{method:16s} {json.dumps(params)[:140]}")
+        desc = _describe_event(msg)
+        if desc is not None:
+            print(desc)
     return 0
 
 
@@ -776,16 +821,47 @@ def remove_worktree(state: dict) -> bool:
 
 
 def cmd_gc(args) -> int:
-    cutoff = time.time() - args.keep_days * 24 * 3600
-    removed, kept = 0, []
-    for state in list_jobs():
-        if state.get("phase") in TERMINAL_PHASES and (state.get("finished_at") or state.get("started_at") or 0) < cutoff:
-            if not remove_worktree(state):
-                kept.append(state["job_id"])
+    if args.job:
+        # Explicit: remove exactly these finished jobs, ignore all scoping.
+        targets = []
+        for prefix in args.job:
+            state = load_state(resolve_job_id(prefix))
+            if state and state.get("phase") in TERMINAL_PHASES:
+                targets.append(state)
+            elif state:
+                print(f"codexspin: {state['job_id']} is {state.get('phase')}, not removing")
+    else:
+        # Sweep finished jobs older than keep-days — but ONLY those whose cwd is
+        # under this directory, so `gc` in one project can't nuke another's (or
+        # another session's) jobs. --everywhere opts into the machine-wide sweep.
+        cutoff = time.time() - args.keep_days * 24 * 3600
+        here = os.path.realpath(os.getcwd())
+        targets = []
+        for state in list_jobs():
+            if state.get("phase") not in TERMINAL_PHASES:
                 continue
-            shutil.rmtree(job_dir(state["job_id"]), ignore_errors=True)
-            removed += 1
-    print(f"removed {removed} finished job(s) older than {args.keep_days}d")
+            if (state.get("finished_at") or state.get("started_at") or 0) >= cutoff:
+                continue
+            job_cwd = os.path.realpath(state.get("repo_root") or state.get("cwd") or "/")
+            if not args.everywhere and not (job_cwd == here or job_cwd.startswith(here + os.sep)):
+                continue
+            targets.append(state)
+
+    removed, kept = 0, []
+    for state in targets:
+        if args.dry_run:
+            print(f"would remove {state['job_id']} ({state.get('phase')})")
+            continue
+        if not remove_worktree(state):
+            kept.append(state["job_id"])
+            continue
+        shutil.rmtree(job_dir(state["job_id"]), ignore_errors=True)
+        removed += 1
+    if args.dry_run:
+        print(f"dry-run: {len(targets)} job(s) would be removed")
+    else:
+        scope = "" if (args.job or args.everywhere) else " under this directory"
+        print(f"removed {removed} finished job(s){scope}")
     for job_id in kept:
         print(f"kept {job_id}: worktree has uncommitted changes")
     return 0
@@ -889,6 +965,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("send", help="follow-up turn on a finished job's thread")
     p.add_argument("job")
     p.add_argument("prompt", help="follow-up prompt ('-' reads stdin)")
+    p.add_argument("--wait", action="store_true", help="block and print the result (like run)")
+    p.add_argument("--timeout", type=float, default=None, help="with --wait, give up after N seconds")
+    p.add_argument("--json", action="store_true", help="with --wait, print result as JSON")
     _add_host_argument(p)
     p.set_defaults(fn=cmd_send)
 
@@ -907,6 +986,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("logs", help="show recent job events")
     p.add_argument("job")
     p.add_argument("-n", "--lines", type=int, default=40)
+    p.add_argument("--json", action="store_true", help="print raw event JSON instead of readable lines")
     _add_host_argument(p)
     p.set_defaults(fn=cmd_logs)
 
@@ -914,8 +994,12 @@ def main(argv: list[str] | None = None) -> int:
     _add_host_argument(p)
     p.set_defaults(fn=cmd_doctor)
 
-    p = sub.add_parser("gc", help="delete old finished jobs")
+    p = sub.add_parser("gc", help="delete finished jobs (this project by default)")
+    p.add_argument("job", nargs="*", help="specific job id(s) to remove; omit to sweep by age")
     p.add_argument("--keep-days", type=int, default=7)
+    p.add_argument("--everywhere", action="store_true",
+                   help="sweep jobs from all projects, not just this directory")
+    p.add_argument("--dry-run", action="store_true", help="show what would be removed")
     _add_host_argument(p)
     p.set_defaults(fn=cmd_gc)
 

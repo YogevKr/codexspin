@@ -59,9 +59,15 @@ def run_turn():
                                   "turn": {"id": TURN_ID, "status": "failed",
                                            "error": {"message": "fake model exploded"}}})
         return
-    notify("item/completed", {"threadId": THREAD_ID, "turnId": TURN_ID,
-                              "item": {"type": "fileChange", "id": "i2",
-                                       "changes": [{"path": "src/example.py", "kind": "edit"}]}})
+    if MODE == "move":
+        notify("item/completed", {"threadId": THREAD_ID, "turnId": TURN_ID,
+                                  "item": {"type": "fileChange", "id": "i2", "changes": [
+                                      {"path": "old.txt",
+                                       "kind": {"type": "update", "move_path": "new.txt"}}]}})
+    else:
+        notify("item/completed", {"threadId": THREAD_ID, "turnId": TURN_ID,
+                                  "item": {"type": "fileChange", "id": "i2",
+                                           "changes": [{"path": "src/example.py", "kind": "edit"}]}})
     notify("item/completed", {"threadId": THREAD_ID, "turnId": TURN_ID,
                               "item": {"type": "agentMessage", "id": "i3", "text": "FAKE-DONE",
                                        "phase": "final_answer"}})
