@@ -124,6 +124,17 @@ fake), `CODEXSPIN_SSH_BIN` (ssh transport override, default `ssh`),
 `CODEXSPIN_STARTUP_TIMEOUT` (seconds to wait for app-server responses
 during startup, default 180).
 
+## Claude Code skill
+
+`skills/codex/SKILL.md` is a Claude Code skill covering how to drive codex as
+a second agent — review discipline, delegation prompting, sandbox choices, and
+codexspin routing (including known failure modes and their recoveries). To use
+it, symlink it into your user skills:
+
+```sh
+ln -s "$(pwd)/skills/codex" ~/.claude/skills/codex
+```
+
 ## Tests
 
 ```sh
