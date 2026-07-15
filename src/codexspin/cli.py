@@ -1,6 +1,7 @@
 """codexspin — spin and manage parallel Codex sessions.
 
   codexspin spawn [-s SANDBOX | --yolo] [-w|--worktree] [--max-minutes N] [-m MODEL] [-e EFFORT] [-C DIR] [-n NAME] "prompt"
+  codexspin run   <same options as spawn> "prompt"   # foreground: spawn + wait + print
   codexspin status [JOB]
   codexspin result JOB [--json]
   codexspin await JOB [JOB...] [--timeout SECS]
@@ -54,9 +55,9 @@ print(p.pid)
 """
 
 _REMOTE_COMMANDS = frozenset({
-    "spawn", "status", "result", "await", "send", "cancel", "logs", "doctor", "gc",
+    "spawn", "run", "status", "result", "await", "send", "cancel", "logs", "doctor", "gc",
 })
-_REMOTE_PROMPT_COMMANDS = frozenset({"spawn", "send"})
+_REMOTE_PROMPT_COMMANDS = frozenset({"spawn", "run", "send"})
 _REMOTE_INSTALL_HINT = (
     "codexspin: remote codexspin not found; install it there with: uv tool install codexspin"
 )
@@ -201,7 +202,9 @@ def create_worktree(cwd: str, job_id: str) -> dict:
             "git_common_dir": common_dir}
 
 
-def cmd_spawn(args) -> int:
+def _create_job(args) -> str:
+    """Create the job dir, launch the detached runner, return the job id.
+    Shared by `spawn` (prints the id) and `run` (waits on it)."""
     sandbox = "danger-full-access" if args.yolo else args.sandbox
     # realpath: symlinked paths (macOS /tmp!) must match git's physical
     # toplevel or the worktree-relative math escapes the worktree.
@@ -256,8 +259,36 @@ def cmd_spawn(args) -> int:
     state = read_json(jd / "state.json") or {}
     state["runner_pid"] = pid
     write_json(jd / "state.json", state)
-    print(job_id)
+    return job_id
+
+
+def cmd_spawn(args) -> int:
+    print(_create_job(args))
     return 0
+
+
+def cmd_run(args) -> int:
+    """spawn + await + result in one foreground command. The job is still
+    detached: Ctrl-C or a timeout leaves it running to re-attach later."""
+    job_id = _create_job(args)
+    print(f"codexspin: running {job_id}", file=sys.stderr)
+    deadline = time.time() + args.timeout if args.timeout else None
+    try:
+        while True:
+            state = load_state(job_id) or {}
+            if state.get("phase") in TERMINAL_PHASES:
+                break
+            if deadline and time.time() > deadline:
+                print(f"codexspin: {job_id} still running after {args.timeout}s — job continues; "
+                      f"`codexspin await {job_id}`", file=sys.stderr)
+                return 2
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print(f"\ncodexspin: detached — {job_id} still running "
+              f"(`codexspin await {job_id}` to re-attach, `codexspin cancel {job_id}` to stop)",
+              file=sys.stderr)
+        return 130
+    return cmd_result(argparse.Namespace(job=job_id, json=args.json))
 
 
 def use_color() -> bool:
@@ -809,23 +840,32 @@ def main(argv: list[str] | None = None) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    def add_spawn_args(p):
+        p.add_argument("prompt", help="task prompt ('-' reads stdin)")
+        p.add_argument("-s", "--sandbox", choices=SANDBOX_MODES, default="workspace-write")
+        p.add_argument("--yolo", action="store_true", help="shortcut for --sandbox danger-full-access")
+        p.add_argument("-m", "--model", default=None)
+        p.add_argument("-e", "--effort", default=None,
+                       choices=["none", "minimal", "low", "medium", "high", "xhigh"])
+        p.add_argument("-C", "--cwd", default=None, help="working directory (default: current)")
+        p.add_argument("-n", "--name", default=None, help="job name used in the job id")
+        p.add_argument("-w", "--worktree", action="store_true",
+                       help="run in a fresh git worktree (branch codexspin/<job-id>)")
+        p.add_argument("--max-minutes", type=float, default=None,
+                       help="interrupt the job after this many minutes (phase: timeout)")
+        p.add_argument("--writable-root", action="append", metavar="DIR",
+                       help="extra writable dir for the workspace-write sandbox (repeatable)")
+        _add_host_argument(p)
+
     p = sub.add_parser("spawn", help="spawn a detached codex job")
-    p.add_argument("prompt", help="task prompt ('-' reads stdin)")
-    p.add_argument("-s", "--sandbox", choices=SANDBOX_MODES, default="workspace-write")
-    p.add_argument("--yolo", action="store_true", help="shortcut for --sandbox danger-full-access")
-    p.add_argument("-m", "--model", default=None)
-    p.add_argument("-e", "--effort", default=None,
-                   choices=["none", "minimal", "low", "medium", "high", "xhigh"])
-    p.add_argument("-C", "--cwd", default=None, help="working directory (default: current)")
-    p.add_argument("-n", "--name", default=None, help="job name used in the job id")
-    p.add_argument("-w", "--worktree", action="store_true",
-                   help="run in a fresh git worktree (branch codexspin/<job-id>)")
-    p.add_argument("--max-minutes", type=float, default=None,
-                   help="interrupt the job after this many minutes (phase: timeout)")
-    p.add_argument("--writable-root", action="append", metavar="DIR",
-                   help="extra writable dir for the workspace-write sandbox (repeatable)")
-    _add_host_argument(p)
+    add_spawn_args(p)
     p.set_defaults(fn=cmd_spawn)
+
+    p = sub.add_parser("run", help="spawn + wait + print result in one foreground command")
+    add_spawn_args(p)
+    p.add_argument("--timeout", type=float, default=None, help="give up waiting after N seconds (job keeps running)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("status", help="show jobs (running + last 24h by default)")
     p.add_argument("job", nargs="?")

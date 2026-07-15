@@ -916,3 +916,31 @@ def test_codex_minor_parsing():
     assert cli._codex_minor("codex-cli 0.144.1") == "0.144"
     assert cli._codex_minor("codex-cli 0.199.0 (x)") == "0.199"
     assert cli._codex_minor("garbage") is None
+
+
+def test_run_foreground_spawn_wait_result(capsys):
+    rc = cli.main(["run", "-n", "fg", "do the thing"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "FAKE-DONE" in out          # printed the result inline
+    # the job record persists for later send/logs
+    job_line = [ln for ln in out.splitlines() if ln.startswith("# fg-")]
+    assert job_line, out
+    job_id = job_line[0][2:].split(" — ")[0]
+    assert jobs.load_state(job_id)["phase"] == "done"
+
+
+def test_run_failed_job_exit_code(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "fail")
+    rc = cli.main(["run", "fail me"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "fake model exploded" in out
+
+
+def test_run_timeout_leaves_job_running(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "slow")
+    rc = cli.main(["run", "--timeout", "0.5", "slow one"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "still running after" in err

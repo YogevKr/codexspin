@@ -35,6 +35,7 @@ codexspin spawn -w -n fix-b "Fix the pagination..."
 codexspin spawn -w -n fix-c --max-minutes 30 "Refactor the dispatcher..."
 
 codexspin status              # running + last 24h (--all for everything)
+codexspin run "..."          # foreground: spawn + wait + print (one job you'll watch)
 codexspin await JOB [JOB...]  # block until done, print results
 codexspin result JOB [--json]
 codexspin send JOB "follow-up on the same codex thread"
