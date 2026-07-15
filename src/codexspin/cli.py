@@ -285,18 +285,18 @@ PHASE_GLYPH = {
 STALE_SECONDS = 180
 
 
-def _heartbeat_line(job_id: str, now: float | None = None) -> tuple[str, bool]:
-    events_path = job_dir(job_id) / "events.jsonl"
+def _heartbeat_line(s: dict, now: float | None = None) -> tuple[str, bool]:
+    # Cheap: one stat, never a full read. Age comes from events.jsonl mtime
+    # (bumped on every appended notification); count is persisted in state by
+    # the runner so status never rescans an append-only log.
     try:
-        with events_path.open("rb") as events_file:
-            event_count = sum(1 for _ in events_file)
-            mtime = os.fstat(events_file.fileno()).st_mtime
+        stat = (job_dir(s["job_id"]) / "events.jsonl").stat()
     except OSError:
         return "heartbeat: no events yet", False
-    if not event_count:
+    if stat.st_size == 0:
         return "heartbeat: no events yet", False
-
-    age = int(max(0, (now if now is not None else time.time()) - mtime))
+    event_count = s.get("event_count", 0)
+    age = int(max(0, (now if now is not None else time.time()) - stat.st_mtime))
     if age > STALE_SECONDS:
         quiet_age = f"{age // 60}m" if age < 3600 else f"{age // 3600}h"
         return (f"⚠ quiet {quiet_age} — last event {age}s ago · "
@@ -305,10 +305,21 @@ def _heartbeat_line(job_id: str, now: float | None = None) -> tuple[str, bool]:
 
 
 def _terminal_reason(s: dict) -> str:
+    # Prefer a persisted error (failed/timeout write one); otherwise give a
+    # phase-specific cause — never leak an ambiguous activity like "finished".
     result = read_json(job_dir(s["job_id"]) / "result.json") or {}
     error = result.get("error") or {}
     message = error.get("message") if isinstance(error, dict) else None
-    return " ".join(str(message or s.get("activity") or "unknown").split())
+    if message:
+        return " ".join(str(message).split())
+    phase = s.get("phase")
+    if phase == "cancelled":
+        return "cancelled"
+    if phase == "died":
+        return "runner exited without finishing (see codexspin logs)"
+    if phase == "timeout":
+        return "exceeded max runtime"
+    return " ".join(str(s.get("activity") or "unknown").split())
 
 
 def _truncate_line(text: str, width: int) -> str:
@@ -361,7 +372,7 @@ def print_job_fancy(st: Style, s: dict, width: int) -> None:
     print(f"  {st.dim(s.get('prompt_preview', '')[:width - 4])}")
     if not finished:
         print(f"  {st.cyan('↳ ' + str(s.get('activity', ''))[:width - 6])}")
-        heartbeat, stale = _heartbeat_line(s["job_id"])
+        heartbeat, stale = _heartbeat_line(s)
         heartbeat = _truncate_line(heartbeat, width - 2)
         print(f"  {(st.yellow if stale else st.dim)(heartbeat)}")
     elif phase != "done":
@@ -390,7 +401,7 @@ def print_job_plain(s: dict, width: int = 120) -> None:
     print(f"  {s.get('prompt_preview', '')}")
     if s.get("phase") not in TERMINAL_PHASES:
         print(f"  ↳ {s.get('activity', '')}")
-        heartbeat, _ = _heartbeat_line(s["job_id"])
+        heartbeat, _ = _heartbeat_line(s)
         print(f"  {_truncate_line(heartbeat, width - 2)}")
     elif s.get("phase") != "done":
         reason = _truncate_line(f"reason: {_terminal_reason(s)}", width - 2)

@@ -38,6 +38,7 @@ class Runner:
         self.turn_error: dict | None = None
         self.touched_files: list[str] = []
         self.command_count = 0
+        self.event_count = self.state.get("event_count", 0)
         self.cancelled = False
         self.timed_out = False
         self._state_lock = threading.Lock()
@@ -50,7 +51,7 @@ class Runner:
         # thread all write state; serialize so a snapshot is never taken
         # mid-mutation.
         with self._state_lock:
-            self.state.update(updates, updated_at=time.time())
+            self.state.update(updates, updated_at=time.time(), event_count=self.event_count)
             write_json(self.dir / "state.json", dict(self.state))
 
     def on_notification(self, msg: dict) -> None:
@@ -60,6 +61,7 @@ class Runner:
             self.final_turn = params.get("turn") or {}
             self.turn_done.set()
 
+        self.event_count += 1
         try:
             self.events.write(json.dumps(msg) + "\n")
         except OSError as exc:
