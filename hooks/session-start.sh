@@ -2,18 +2,27 @@
 # SessionStart hook: surface codexspin background jobs so detached fleets are
 # never forgotten across sessions. Silent when there is nothing to report.
 
-# GUI-launched sessions (desktop app) get a minimal PATH without the usual
-# CLI install locations — fall back to them explicitly.
-find_codexspin() {
-  command -v codexspin 2>/dev/null && return 0
-  for candidate in "$HOME/.local/bin/codexspin" /opt/homebrew/bin/codexspin /usr/local/bin/codexspin; do
-    if [ -x "$candidate" ]; then
-      echo "$candidate"
-      return 0
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# shellcheck source=../scripts/find-codexspin.sh
+. "$PLUGIN_ROOT/scripts/find-codexspin.sh"
+
+input="$(cat)"
+# Preserve the raw hook metadata without depending on an installed/upgraded
+# codexspin CLI. The Python CLI validates and reads transcript_path later.
+if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
+  metadata_dir="${CLAUDE_PLUGIN_DATA:-$(dirname "$CLAUDE_ENV_FILE")}"
+  if mkdir -p "$metadata_dir" 2>/dev/null; then
+    # CLAUDE_PLUGIN_DATA persists across sessions. Bound our metadata footprint
+    # while leaving fresh files available to still-running Claude sessions.
+    find "$metadata_dir" -type f -name 'session-start.*' -mtime +0 \
+      -exec rm -f {} + 2>/dev/null || :
+    metadata_file="$(mktemp "$metadata_dir/session-start.XXXXXX")" || metadata_file=""
+    if [ -n "$metadata_file" ]; then
+      printf '%s' "$input" > "$metadata_file"
+      printf 'export CODEXSPIN_SESSION_METADATA=%q\n' "$metadata_file" >> "$CLAUDE_ENV_FILE"
     fi
-  done
-  return 1
-}
+  fi
+fi
 
 BIN="$(find_codexspin)" || exit 0
 out="$("$BIN" status 2>/dev/null)" || exit 0

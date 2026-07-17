@@ -1,7 +1,8 @@
 # codexspin
 
 Spin and manage parallel Codex sessions from the command line (or from Claude
-Code) via the `codex app-server` JSON-RPC API. Replaces the tmux screen-scrape
+Code), and transfer Claude Code sessions into Codex with their visible history,
+via the `codex app-server` JSON-RPC API. Replaces the tmux screen-scrape
 (`codex-agent`) and the `nohup` + session-file-watchdog pattern for background
 `codex exec` runs.
 
@@ -19,7 +20,8 @@ uv tool install git+https://github.com/YogevKr/codexspin
 uv tool install --editable .
 ```
 
-Requires `codex` on PATH, already authenticated (`codex login`).
+Requires `codex` on PATH, already authenticated (`codex login`). The Claude
+Code transfer command requires the codexspin 0.2.0+ CLI.
 
 ## Usage
 
@@ -39,6 +41,7 @@ codexspin run "..."          # foreground: spawn + wait + print (one job you'll 
 codexspin await JOB [JOB...]  # block until done, print results
 codexspin result JOB [--json]
 codexspin send JOB "..." [--wait]   # follow-up on the warm thread (--wait blocks + prints)
+codexspin transfer [--source CLAUDE_JSONL]  # Claude Code session -> resumable Codex thread
 codexspin handoff JOB HOST ["continue on the remote"]
 codexspin cancel JOB [--hard]
 codexspin logs JOB
@@ -123,20 +126,53 @@ Environment variables: `CODEXSPIN_HOME` (state root, default `~/.codexspin`),
 fake), `CODEXSPIN_SSH_BIN` (ssh transport override, default `ssh`),
 `CODEXSPIN_RSYNC_BIN` (rsync transport override, default `rsync`), and
 `CODEXSPIN_STARTUP_TIMEOUT` (seconds to wait for app-server responses
-during startup, default 180).
+during startup, default 180). Session transfer also supports
+`CODEXSPIN_TRANSFER_TIMEOUT` (seconds to wait for the native import, default
+120).
 
 ## Claude Code skill
 
 This repo is also a Claude Code plugin: the `skills/codex` skill (how to
 drive codex as a second agent — review discipline, delegation prompting,
-sandbox choices, codexspin routing, failure-mode recoveries) plus a
-SessionStart hook that lists running/recently-finished codexspin jobs at the
-top of every session, so detached fleets are never forgotten.
+sandbox choices, codexspin routing, failure-mode recoveries), a command for
+transferring the current Claude session into Codex, and a SessionStart hook
+that lists running/recently-finished codexspin jobs at the top of every
+session, so detached fleets are never forgotten.
 
 ```sh
 claude plugin marketplace add YogevKr/codexspin
 claude plugin install codexspin@codexspin
 ```
+
+### Continue a Claude Code session in Codex
+
+From the Claude Code session you want to continue, run:
+
+```text
+/codexspin:transfer
+```
+
+The plugin automatically captures the current session's transcript path, then
+uses Codex's native importer to create a persistent thread. The imported user
+and assistant turns appear as visible history in Codex. On success, the command
+prints the new session ID and the exact command for opening it interactively:
+
+```sh
+codex resume <thread-id>
+```
+
+To transfer a different Claude session, use the CLI's explicit source override
+from a terminal:
+
+```sh
+codexspin transfer --source ~/.claude/projects/<project>/<session-id>.jsonl
+```
+
+Codex accepts only `.jsonl` Claude transcripts stored beneath
+`~/.claude/projects/`; codexspin validates this restriction before importing.
+If the installed Codex app-server does not support session import, codexspin
+detects it and prints the upgrade command
+(`npm install -g @openai/codex@latest`) before asking you to retry.
 
 Prefer just the skill without hooks? Symlink it instead (don't do both, or
 the skill loads twice):

@@ -1,7 +1,7 @@
 {
   "name": "codexspin",
-  "description": "Spin and manage parallel Codex sessions: skill for driving codex/codexspin as a second agent, plus a session-start hook that surfaces running and recently finished background jobs.",
-  "version": "0.1.1",
+  "description": "Spin and manage parallel Codex sessions, transfer the current Claude Code session into a resumable Codex thread with visible history, and surface background jobs at session start.",
+  "version": "0.2.0",
   "author": {
     "name": "Yogev Kriger",
     "url": "https://github.com/YogevKr"

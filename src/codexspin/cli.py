@@ -6,6 +6,7 @@
   codexspin result JOB [--json]
   codexspin await JOB [JOB...] [--timeout SECS]
   codexspin send JOB "follow-up"
+  codexspin transfer [--source CLAUDE_JSONL]
   codexspin handoff JOB HOST ["follow-up"]
   codexspin cancel JOB [--hard]
   codexspin logs JOB [-n LINES]
@@ -44,6 +45,7 @@ from .jobs import (
     resolve_job_id,
     write_json,
 )
+from .transfer import TransferError, transfer_claude_session
 
 
 _DETACH = """
@@ -576,6 +578,21 @@ def cmd_send(args) -> int:
     return 0
 
 
+def cmd_transfer(args) -> int:
+    try:
+        result = transfer_claude_session(args.source, os.getcwd())
+    except TransferError as exc:
+        raise SystemExit(f"codexspin: {exc}") from exc
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print("Transferred the Claude session into a Codex thread with visible turn history.")
+        print(f"Codex session ID: {result['threadId']}")
+        print(f"Resume in Codex: {result['resumeCommand']}")
+    return 0
+
+
 def find_session_rollout(thread_id: str) -> Path:
     sessions = Path.home() / ".codex" / "sessions"
     if sessions.is_dir():
@@ -970,6 +987,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="with --wait, print result as JSON")
     _add_host_argument(p)
     p.set_defaults(fn=cmd_send)
+
+    p = sub.add_parser(
+        "transfer", help="import a Claude Code session into a persistent Codex thread"
+    )
+    p.add_argument("--source", metavar="CLAUDE_JSONL",
+                   help="Claude transcript (default: current plugin session)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_transfer)
 
     p = sub.add_parser("handoff", help="copy a job to another machine and resume it there")
     p.add_argument("job")
