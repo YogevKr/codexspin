@@ -34,12 +34,14 @@ from .jobs import (
     SANDBOX_MODES,
     pid_is_runner,
     TERMINAL_PHASES,
+    current_session_id,
     fmt_elapsed,
     job_dir,
     jobs_root,
     list_jobs,
     load_state,
     new_job_id,
+    owned_by_other_session,
     read_json,
     resolve_job_id,
     write_json,
@@ -139,6 +141,11 @@ def _remote_command(parts: list[str]) -> str:
     home = os.environ.get("CODEXSPIN_HOME")
     if home:
         command = f"CODEXSPIN_HOME={shlex.quote(home)} {command}"
+    # ssh strips arbitrary env vars, so session ownership must ride the command
+    # line or remote spawns come back untagged and remote status unscoped.
+    session = current_session_id()
+    if session:
+        command = f"CLAUDE_CODE_SESSION_ID={shlex.quote(session)} {command}"
     return command
 
 
@@ -220,6 +227,7 @@ def _create_job(args) -> str:
         raise SystemExit("codexspin: empty prompt")
 
     job_id = new_job_id(args.name)
+    session_id = current_session_id()
     wt = create_worktree(cwd, job_id) if args.worktree else {}
     if wt:
         # Preserve a requested subdirectory: -C repo/pkg maps to <worktree>/pkg.
@@ -242,6 +250,7 @@ def _create_job(args) -> str:
         "max_minutes": args.max_minutes,
         "writable_roots": [os.path.realpath(r) for r in writable_roots],
         "created_at": time.time(),
+        **({"session_id": session_id} if session_id else {}),
         **wt,
     })
     write_json(jd / "state.json", {
@@ -252,6 +261,7 @@ def _create_job(args) -> str:
         "prompt_preview": " ".join(prompt.split())[:120],
         "started_at": time.time(),
         "activity": "launching runner",
+        **({"session_id": session_id} if session_id else {}),
         **({"branch": wt["branch"], "worktree": wt["worktree"], "repo_root": wt["repo_root"],
             "git_common_dir": wt["git_common_dir"]} if wt else {}),
     })
@@ -427,6 +437,8 @@ def print_job_fancy(st: Style, s: dict, width: int) -> None:
     meta = []
     if s.get("branch"):
         meta.append(f"branch {s['branch']}")
+    if owned_by_other_session(s, current_session_id()):
+        meta.append(f"session {s['session_id'][:8]}")
     if s.get("thread_id"):
         meta.append(f"resume: codex resume {s['thread_id']}")
     if meta:
@@ -454,12 +466,26 @@ def print_job_plain(s: dict, width: int = 120) -> None:
         print(f"  {reason}")
     if s.get("branch"):
         print(f"  branch: {s['branch']}  worktree: {s.get('worktree', '')}")
+    if owned_by_other_session(s, current_session_id()):
+        print(f"  session: {s['session_id'][:8]}")
     if s.get("thread_id"):
         print(f"  resume: codex resume {s['thread_id']}")
 
 
+def _other_sessions_line(others: list[dict]) -> str:
+    count = len(others)
+    sessions = len({s.get("session_id") for s in others})
+    running = sum(1 for s in others if s.get("phase") not in TERMINAL_PHASES)
+    running_note = f", {running} running" if running else ""
+    return (f"+ {count} job{'s' if count != 1 else ''} from {sessions} other "
+            f"Claude session{'s' if sessions != 1 else ''}{running_note}"
+            f" — codexspin status --all-sessions")
+
+
 def cmd_status(args) -> int:
+    others: list[dict] = []
     if args.job:
+        # Explicit job id: cross-session escape hatch, never filtered.
         states = [s for s in [load_state(resolve_job_id(args.job))] if s]
     else:
         states = list_jobs()
@@ -467,27 +493,40 @@ def cmd_status(args) -> int:
             cutoff = time.time() - 24 * 3600
             states = [s for s in states
                       if s.get("phase") not in TERMINAL_PHASES or (s.get("started_at") or 0) > cutoff]
+        session = None if args.all_sessions else current_session_id()
+        if session:
+            others = [s for s in states if owned_by_other_session(s, session)]
+            states = [s for s in states if not owned_by_other_session(s, session)]
     if args.json:
         print(json.dumps(states, indent=2))
         return 0
     if not states:
+        if others:
+            print(_other_sessions_line(others))
+            return 0
         print("no jobs (use --all to include old finished jobs)")
         return 0
     fancy = use_color()
     st = Style(fancy)
     width = shutil.get_terminal_size((120, 24)).columns if fancy else 120
-    quota = None
     for s in states:
         if fancy:
             print_job_fancy(st, s, width)
         else:
             print_job_plain(s, width)
+    # Quota is account-wide: hidden foreign jobs stay eligible for the freshest
+    # snapshot even though their details are not rendered.
+    quota = None
+    for s in [*states, *others]:
         q = s.get("quota")
         if q and (quota is None or (q.get("at") or 0) > (quota.get("at") or 0)):
             quota = q
     if quota:
         prefix = "" if fancy else "\n"
         print(f"{prefix}{quota_line(st, quota, fancy)}")
+    if others:
+        prefix = "" if fancy else "\n"
+        print(f"{prefix}{st.gray(_other_sessions_line(others))}")
     return 0
 
 
@@ -946,6 +985,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("status", help="show jobs (running + last 24h by default)")
     p.add_argument("job", nargs="?")
     p.add_argument("--all", action="store_true")
+    p.add_argument("--all-sessions", action="store_true",
+                   help="include jobs owned by other Claude sessions "
+                        "(default when not inside a Claude session)")
     p.add_argument("--json", action="store_true")
     _add_host_argument(p)
     p.set_defaults(fn=cmd_status)

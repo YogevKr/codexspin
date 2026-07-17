@@ -30,6 +30,21 @@ def jobs_root() -> Path:
     return Path(root) / "jobs"
 
 
+def current_session_id() -> str | None:
+    """The Claude Code session this process runs inside, if any.
+
+    Claude Code exports this to every Bash call; the SessionStart hook sets it
+    explicitly from its stdin payload. Absent in a plain terminal.
+    """
+    return os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+
+
+def owned_by_other_session(state: dict, session_id: str | None) -> bool:
+    """Jobs without a session tag are shared; tagged jobs belong to one session."""
+    owner = state.get("session_id")
+    return bool(owner) and owner != session_id
+
+
 def new_job_id(name: str | None) -> str:
     slug = re.sub(r"[^a-z0-9-]+", "-", (name or "job").lower()).strip("-") or "job"
     stamp = time.strftime("%m%d-%H%M%S")

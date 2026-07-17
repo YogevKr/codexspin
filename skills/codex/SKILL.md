@@ -171,9 +171,11 @@ Verified against codex-cli 0.144 (July 2026).
    kills your wait, not the job. Rare niche: to react per-job as a large
    fleet lands (rather than when the whole await exits), wrap `await` in a
    Monitor and let its per-job result lines stream as events.
-3. `codexspin status` — live phase + current activity per job;
-   `codexspin logs <job>` for the event tail; `codexspin cancel <job>` to
-   interrupt (`--hard` kills the process group).
+3. `codexspin status` — live phase + current activity per job. Scoped to
+   this Claude session (plus untagged jobs); other sessions' jobs collapse
+   into a one-line count — `--all-sessions` lists them, and explicit job ids
+   always work across sessions. `codexspin logs <job>` for the event tail;
+   `codexspin cancel <job>` to interrupt (`--hard` kills the process group).
 4. `codexspin send <job> "<follow-up>"` — next turn on the same warm thread.
    Refuses while the job is running; await it first. The printed
    `codex resume <thread-id>` line drops the user into the session

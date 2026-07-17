@@ -30,6 +30,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_MODE", "ok")
     monkeypatch.delenv("FAKE_SSH_ARGV_FILE", raising=False)
     monkeypatch.delenv("FAKE_SSH_MISSING_CODEXSPIN", raising=False)
+    # The test process itself may run inside a Claude session; session scoping
+    # must be opted into per test, never inherited.
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     monkeypatch.chdir(tmp_path)
     yield
 
@@ -304,6 +307,137 @@ def test_failed_status_shows_reason_inline(capsys, monkeypatch):
     assert wait_terminal(job_id)["phase"] == "failed"
     cli.main(["status", job_id])
     assert "reason: fake model exploded" in capsys.readouterr().out
+
+
+SESSION_A = "aaaa1111-2222-3333-4444-555566667777"
+SESSION_B = "bbbb1111-2222-3333-4444-555566667777"
+
+
+def spawn_owned(capsys, monkeypatch, session_id: str | None, name: str) -> str:
+    if session_id:
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", session_id)
+    else:
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    job_id = spawn(capsys, "-n", name)
+    wait_terminal(job_id)
+    return job_id
+
+
+def test_spawn_stamps_claude_session_id(capsys, monkeypatch):
+    job_id = spawn_owned(capsys, monkeypatch, SESSION_A, "tagged")
+    spec = json.loads((jobs.job_dir(job_id) / "job.json").read_text())
+    assert spec["session_id"] == SESSION_A
+    # The runner's read-modify-write cycle must preserve the tag.
+    assert jobs.load_state(job_id)["session_id"] == SESSION_A
+
+    untagged = spawn_owned(capsys, monkeypatch, None, "untagged")
+    assert "session_id" not in json.loads((jobs.job_dir(untagged) / "job.json").read_text())
+
+
+def test_status_scopes_to_current_session(capsys, monkeypatch):
+    mine = spawn_owned(capsys, monkeypatch, SESSION_A, "mine")
+    theirs = spawn_owned(capsys, monkeypatch, SESSION_B, "theirs")
+    shared = spawn_owned(capsys, monkeypatch, None, "shared")
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION_A)
+    cli.main(["status"])
+    out = capsys.readouterr().out
+    assert mine in out
+    assert shared in out
+    assert theirs not in out
+    assert "+ 1 job from 1 other Claude session — codexspin status --all-sessions" in out
+
+    cli.main(["status", "--all-sessions"])
+    out = capsys.readouterr().out
+    assert mine in out and theirs in out and shared in out
+    assert f"session: {SESSION_B[:8]}" in out
+    assert f"session: {SESSION_A[:8]}" not in out
+    assert "other Claude session" not in out
+
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    cli.main(["status"])
+    out = capsys.readouterr().out
+    assert mine in out and theirs in out and shared in out
+
+
+def test_status_json_respects_session_scope(capsys, monkeypatch):
+    spawn_owned(capsys, monkeypatch, SESSION_B, "beta")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION_A)
+    cli.main(["status", "--json"])
+    assert json.loads(capsys.readouterr().out) == []
+    cli.main(["status", "--all-sessions", "--json"])
+    assert len(json.loads(capsys.readouterr().out)) == 1
+
+
+def test_status_with_only_foreign_jobs_prints_summary_not_no_jobs(capsys, monkeypatch):
+    spawn_owned(capsys, monkeypatch, SESSION_B, "foreign")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION_A)
+    cli.main(["status"])
+    out = capsys.readouterr().out.strip()
+    assert not out.startswith("no jobs")
+    assert out == "+ 1 job from 1 other Claude session — codexspin status --all-sessions"
+
+
+def test_status_quota_survives_session_filtering(capsys, monkeypatch):
+    theirs = spawn_owned(capsys, monkeypatch, SESSION_B, "quota")
+    state = jobs.read_json(jobs.job_dir(theirs) / "state.json")
+    # Strictly freshest snapshot, so it must win over any the fake server pushed.
+    state["quota"] = {"used_percent": 77, "window_mins": 300, "plan": "plus", "at": time.time() + 1000}
+    jobs.write_json(jobs.job_dir(theirs) / "state.json", state)
+    mine = spawn_owned(capsys, monkeypatch, SESSION_A, "mine")
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION_A)
+    cli.main(["status"])
+    out = capsys.readouterr().out
+    assert mine in out and theirs not in out
+    # Quota is account-wide; the freshest snapshot counts even off a hidden job.
+    assert "codex quota: 77% of 5h window used (plan: plus)" in out
+
+
+def test_remote_command_forwards_session_id(capfd, monkeypatch, tmp_path):
+    argv_file = tmp_path / "ssh-argv.json"
+    monkeypatch.setenv("FAKE_SSH_ARGV_FILE", str(argv_file))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION_A)
+    rc = cli.main(["status", "--host", "testbox"])
+    capfd.readouterr()
+    assert rc == 0
+    recorded = json.loads(argv_file.read_text())
+    remote_tokens = shlex.split(" ".join(recorded[1:]))
+    assert f"CLAUDE_CODE_SESSION_ID={SESSION_A}" in remote_tokens
+
+
+def test_session_start_hook_truncation_keeps_other_sessions_summary(capsys, monkeypatch):
+    codexspin_bin = Path(sys.executable).parent / "codexspin"
+    if not codexspin_bin.exists():
+        pytest.skip("codexspin console script not installed next to the interpreter")
+    for i in range(21):
+        spawn_owned(capsys, monkeypatch, SESSION_A, f"bulk{i}")
+    spawn_owned(capsys, monkeypatch, SESSION_B, "foreign")
+
+    hook = Path(__file__).parent.parent / "hooks" / "session-start.sh"
+    env = {**os.environ, "PATH": f"{codexspin_bin.parent}{os.pathsep}{os.environ['PATH']}"}
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    proc = subprocess.run(
+        ["bash", str(hook)], input=json.dumps({"session_id": SESSION_A}),
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+    assert proc.returncode == 0
+    lines = proc.stdout.strip().splitlines()
+    assert any("… truncated" in line for line in lines)
+    assert lines[-1] == "+ 1 job from 1 other Claude session — codexspin status --all-sessions"
+
+
+def test_explicit_job_id_crosses_sessions(capsys, monkeypatch):
+    theirs = spawn_owned(capsys, monkeypatch, SESSION_B, "cross")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION_A)
+    cli.main(["status", theirs])
+    out = capsys.readouterr().out
+    assert theirs in out
+    assert f"session: {SESSION_B[:8]}" in out
+
+    rc = cli.main(["result", theirs])
+    assert rc == 0
+    assert theirs in capsys.readouterr().out
 
 
 def test_send_resumes_thread(capsys):

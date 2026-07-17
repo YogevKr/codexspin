@@ -34,7 +34,8 @@ codexspin spawn -w -n fix-a "Fix the retry logic..."
 codexspin spawn -w -n fix-b "Fix the pagination..."
 codexspin spawn -w -n fix-c --max-minutes 30 "Refactor the dispatcher..."
 
-codexspin status              # running + last 24h (--all for everything)
+codexspin status              # running + last 24h (--all for everything;
+                              # --all-sessions to include other Claude sessions' jobs)
 codexspin run "..."          # foreground: spawn + wait + print (one job you'll watch)
 codexspin await JOB [JOB...]  # block until done, print results
 codexspin result JOB [--json]
@@ -80,6 +81,13 @@ Job ids accept unambiguous prefixes. Every job records the codex thread id, so
 - `--max-minutes N` interrupts a runaway job (phase `timeout`).
 - `status` shows each job's resolved model/effort and the latest ChatGPT
   quota reading (`account/rateLimits/updated` pushed by the app-server).
+- Jobs spawned inside a Claude Code session are tagged with that session's id
+  (from `CLAUDE_CODE_SESSION_ID`). Inside a session, `status` shows that
+  session's jobs plus untagged ones and collapses other sessions' jobs into a
+  one-line count; `--all-sessions` lists everything, labeling each foreign job
+  with `session <id-prefix>`. Outside a session everything is listed. Scoping
+  is visibility only — jobs stay detached, nothing is killed when a session
+  ends, and every command that takes an explicit job id works across sessions.
 
 ## How it works
 
@@ -130,8 +138,9 @@ during startup, default 180).
 This repo is also a Claude Code plugin: the `skills/codex` skill (how to
 drive codex as a second agent — review discipline, delegation prompting,
 sandbox choices, codexspin routing, failure-mode recoveries) plus a
-SessionStart hook that lists running/recently-finished codexspin jobs at the
-top of every session, so detached fleets are never forgotten.
+SessionStart hook that lists that session's running/recently-finished
+codexspin jobs (plus a one-line count of other sessions' fleets) at the top of
+every session, so detached fleets are never forgotten.
 
 ```sh
 claude plugin marketplace add YogevKr/codexspin
