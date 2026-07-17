@@ -1,6 +1,6 @@
 {
   "name": "codexspin",
-  "description": "Parallel Codex session management for Claude Code: delegation skill + background-job visibility.",
+  "description": "Parallel Codex session management for Claude Code: delegation, native session transfer, and background-job visibility.",
   "owner": {
     "name": "Yogev Kriger",
     "url": "https://github.com/YogevKr"
@@ -9,7 +9,7 @@
     {
       "name": "codexspin",
       "source": "./",
-      "description": "Codex delegation skill + session-start visibility for codexspin background jobs. Requires the codexspin CLI (brew install yogevkr/tap/codexspin)."
+      "description": "Codex delegation skill, native Claude-to-Codex session transfer with visible history, and session-start visibility for background jobs. Requires codexspin CLI 0.2.0+ (brew install yogevkr/tap/codexspin)."
     }
   ]
 }

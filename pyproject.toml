@@ -1,7 +1,7 @@
 [project]
 name = "codexspin"
-version = "0.1.1"
-description = "Spin and manage parallel Codex sessions via the codex app-server: spawn / status / result / await / send / cancel, with all three sandbox modes."
+version = "0.3.0"
+description = "Spin and manage parallel Codex sessions, and transfer Claude Code sessions into Codex with visible history."
 requires-python = ">=3.11"
 dependencies = []
 license = {file = "LICENSE"}

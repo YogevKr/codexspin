@@ -6,6 +6,7 @@ Protocol verified against codex-cli 0.144.1:
   turn/completed, error, thread/status/changed, account/rateLimits/updated, ...
   cancel: turn/interrupt {threadId, turnId}
   follow-up: thread/resume {threadId, cwd, approvalPolicy, sandbox} + turn/start
+  Claude transfer: externalAgentConfig/import + externalAgentConfig/import/completed
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import subprocess
 import threading
 from typing import Any, Callable
 
-CLIENT_INFO = {"title": "codexspin", "name": "codexspin", "version": "0.1.0"}
+CLIENT_INFO = {"title": "codexspin", "name": "codexspin", "version": "0.2.0"}
 CAPABILITIES = {
     "experimentalApi": False,
     "requestAttestation": False,
