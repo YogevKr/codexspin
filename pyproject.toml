@@ -1,6 +1,6 @@
 [project]
 name = "codexspin"
-version = "0.3.0"
+version = "0.3.1"
 description = "Spin and manage parallel Codex sessions, and transfer Claude Code sessions into Codex with visible history."
 requires-python = ">=3.11"
 dependencies = []

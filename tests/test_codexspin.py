@@ -720,6 +720,41 @@ def test_worktree_job_gets_git_writable_root(capsys, tmp_path, monkeypatch):
     assert argv[-1] == "app-server"
 
 
+def test_external_worktree_job_gets_git_writable_root(capsys, tmp_path, monkeypatch):
+    # A worktree codexspin did NOT create (added out-of-band), targeted via -C
+    # WITHOUT -w, must still get the shared .git as a sandbox writable root:
+    # the index.lock lives outside the tree, so the sandboxed job can't commit
+    # otherwise. This is the "externally-managed worktree" gap.
+    repo = make_repo(tmp_path / "repo")
+    ext_wt = tmp_path / "external-wt"
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-b", "feature",
+                    str(ext_wt), "HEAD"], check=True, capture_output=True)
+    argv_file = tmp_path / "codex-argv.json"
+    monkeypatch.setenv("FAKE_CODEX_ARGV_FILE", str(argv_file))
+    rc = cli.main(["spawn", "-C", str(ext_wt), "-n", "extwt", "do the thing"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    spec = json.loads((jobs.job_dir(job_id) / "job.json").read_text())
+    common = os.path.realpath(str(repo / ".git"))
+    assert spec["writable_roots"] == [common]
+    wait_terminal(job_id)
+    argv = json.loads(argv_file.read_text())
+    assert argv[0] == "-c"
+    assert json.loads(argv[1].split("=", 1)[1]) == [common]
+
+
+def test_plain_repo_job_gets_no_git_writable_root(capsys, tmp_path):
+    # A normal main-tree repo already has .git inside cwd, so no widening —
+    # the sandbox already covers it. Guards the "outside cwd" condition.
+    repo = make_repo(tmp_path / "repo")
+    rc = cli.main(["spawn", "-C", str(repo), "-n", "plain", "do the thing"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    spec = json.loads((jobs.job_dir(job_id) / "job.json").read_text())
+    assert spec["writable_roots"] == []
+    wait_terminal(job_id)
+
+
 def test_explicit_writable_root_flag(capsys, tmp_path):
     extra = tmp_path / "shared"
     extra.mkdir()

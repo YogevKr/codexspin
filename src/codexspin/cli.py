@@ -190,6 +190,31 @@ def git(repo: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
 
 
+def git_common_dir(cwd: str) -> str:
+    """Absolute path to the repository's shared git dir — where the index and
+    the index.lock every commit takes actually live — or "" if cwd is not in a
+    work tree. For a linked worktree this resolves to the MAIN repo's .git,
+    which sits OUTSIDE the worktree directory."""
+    common = git(cwd, "rev-parse", "--git-common-dir")
+    if common.returncode != 0:
+        return ""
+    path = common.stdout.strip()
+    if path and not os.path.isabs(path):
+        path = os.path.normpath(os.path.join(cwd, path))
+    return path
+
+
+def _is_within(path: str, root: str) -> bool:
+    """True if path is inside root (both fully resolved). Used to skip the
+    sandbox widening when a git dir already sits under cwd and is thus already
+    writable."""
+    try:
+        root_real = os.path.realpath(root)
+        return os.path.commonpath([os.path.realpath(path), root_real]) == root_real
+    except ValueError:  # different drives (Windows): not comparable
+        return False
+
+
 def create_worktree(cwd: str, job_id: str) -> dict:
     top = git(cwd, "rev-parse", "--show-toplevel")
     if top.returncode != 0:
@@ -197,10 +222,7 @@ def create_worktree(cwd: str, job_id: str) -> dict:
     repo_root = top.stdout.strip()
     # The common git dir survives even if the spawning worktree is later
     # removed — record it so gc can always clean up.
-    common = git(repo_root, "rev-parse", "--git-common-dir")
-    common_dir = common.stdout.strip() if common.returncode == 0 else ""
-    if common_dir and not os.path.isabs(common_dir):
-        common_dir = os.path.normpath(os.path.join(repo_root, common_dir))
+    common_dir = git_common_dir(repo_root)
     wt_path = str(jobs_root().parent / "worktrees" / job_id)
     branch = f"codexspin/{job_id}"
     Path(wt_path).parent.mkdir(parents=True, exist_ok=True)
@@ -238,10 +260,17 @@ def _create_job(args) -> str:
     jd = job_dir(job_id)
     jd.mkdir(parents=True)
     writable_roots = list(args.writable_root or [])
-    if wt and sandbox == "workspace-write" and wt.get("git_common_dir"):
-        # Linked-worktree git metadata lives outside the tree; without this
-        # root the job cannot git-commit its own work.
-        writable_roots.append(wt["git_common_dir"])
+    if sandbox == "workspace-write":
+        # A linked worktree's git metadata (index, and the index.lock every
+        # commit takes) lives outside the tree, so a sandbox scoped to cwd
+        # cannot commit. Widen it to the shared git dir when that dir sits
+        # outside cwd. Covers codexspin's own -w worktrees AND jobs pointed at
+        # a pre-existing ("externally-managed") worktree via -C — the latter
+        # never went through create_worktree, so resolve from cwd here. A
+        # normal repo whose .git is already inside cwd needs nothing.
+        common = wt.get("git_common_dir") or git_common_dir(cwd)
+        if common and os.path.isdir(common) and not _is_within(common, cwd):
+            writable_roots.append(common)
     write_json(jd / "job.json", {
         "job_id": job_id,
         "prompt": prompt,
