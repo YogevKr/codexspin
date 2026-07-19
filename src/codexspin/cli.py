@@ -10,6 +10,7 @@
   codexspin handoff JOB HOST ["follow-up"]
   codexspin cancel JOB [--hard]
   codexspin logs JOB [-n LINES]
+  codexspin archive JOB [JOB...]
   codexspin doctor
   codexspin gc [--keep-days N]
 
@@ -19,7 +20,6 @@ Add --host NAME to run any command above on NAME over ssh.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import shlex
 import json
 import os
@@ -33,14 +33,18 @@ from pathlib import Path
 
 from .jobs import (
     SANDBOX_MODES,
+    attention_record,
     pid_is_runner,
     TERMINAL_PHASES,
     current_session_id,
+    exclusive_lock,
     fmt_elapsed,
+    is_archived,
     job_dir,
-    jobs_root,
     list_jobs,
     load_state,
+    mark_archived,
+    mark_viewed,
     new_job_id,
     owned_by_other_session,
     read_json,
@@ -59,7 +63,8 @@ print(p.pid)
 """
 
 _REMOTE_COMMANDS = frozenset({
-    "spawn", "run", "status", "result", "await", "send", "cancel", "logs", "doctor", "gc",
+    "spawn", "run", "status", "result", "await", "send", "cancel", "logs", "archive",
+    "doctor", "gc",
 })
 _REMOTE_PROMPT_COMMANDS = frozenset({"spawn", "run", "send"})
 _REMOTE_INSTALL_HINT = (
@@ -126,6 +131,8 @@ def _run_remote(args, argv: list[str]) -> int:
             completed = subprocess.run(command, stdin=subprocess.DEVNULL)
         else:
             completed = subprocess.run(command, input=prompt, text=True)
+    except KeyboardInterrupt:
+        return 130
     except FileNotFoundError:
         print(f"codexspin: ssh binary not found: {ssh_bin}", file=sys.stderr)
         return 127
@@ -204,6 +211,39 @@ def git_common_dir(cwd: str) -> str:
     return path
 
 
+def git_toplevel(cwd: str) -> str:
+    """Absolute Git worktree root without pathname quoting."""
+    result = subprocess.run(
+        ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return ""
+    return os.path.realpath(os.fsdecode(result.stdout.rstrip(b"\r\n")))
+
+
+def git_primary_worktree(cwd: str) -> str:
+    """Primary checkout root, even when cwd belongs to a linked worktree."""
+    listed = subprocess.run(
+        ["git", "-C", cwd, "worktree", "list", "--porcelain", "-z"],
+        capture_output=True,
+    )
+    if listed.returncode == 0:
+        # Git lists the primary record first. A bare first record means there
+        # is no primary checkout; later records are all linked worktrees and
+        # must not contain child worktrees.
+        first = listed.stdout.split(b"\0\0", 1)[0].split(b"\0")
+        prefix = b"worktree "
+        raw_path = next((field[len(prefix):] for field in first
+                         if field.startswith(prefix)), b"")
+        path = os.fsdecode(raw_path)
+        if path and b"bare" not in first:
+            return os.path.realpath(path)
+        if path:
+            return ""
+    return git_toplevel(cwd)
+
+
 def _is_within(path: str, root: str) -> bool:
     """True if path is inside root (both fully resolved). Used to skip the
     sandbox widening when a git dir already sits under cwd and is thus already
@@ -216,16 +256,52 @@ def _is_within(path: str, root: str) -> bool:
 
 
 def create_worktree(cwd: str, job_id: str) -> dict:
-    top = git(cwd, "rev-parse", "--show-toplevel")
-    if top.returncode != 0:
+    repo_root = git_toplevel(cwd)
+    if not repo_root:
         raise SystemExit(f"codexspin: --worktree requires a git repository at {cwd}")
-    repo_root = top.stdout.strip()
     # The common git dir survives even if the spawning worktree is later
     # removed — record it so gc can always clean up.
     common_dir = git_common_dir(repo_root)
-    wt_path = str(jobs_root().parent / "worktrees" / job_id)
+    # Always use the primary checkout. If cwd is itself a linked worktree,
+    # nesting a child inside it would let GC of the parent delete the child.
+    primary_root = git_primary_worktree(repo_root)
+    # Bare common repositories have no primary checkout. Keep the child next
+    # to the Git database rather than inside it or inside a removable linked
+    # worktree.
+    wt_root = ((Path(primary_root) / ".worktrees") if primary_root else
+               (Path(common_dir).parent / ".worktrees"))
+    try:
+        wt_root.mkdir()
+    except FileExistsError:
+        pass
+    expected_parent = os.path.realpath(wt_root.parent)
+    resolved_root = os.path.realpath(wt_root)
+    if (wt_root.is_symlink() or not wt_root.is_dir()
+            or os.path.dirname(resolved_root) != expected_parent):
+        raise SystemExit(f"codexspin: unsafe worktree root: {wt_root}")
+    # A repo-local checkout should not make the parent repository dirty. Keep
+    # this machine-local: do not edit the project's tracked .gitignore.
+    if common_dir:
+        exclude = Path(common_dir) / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        # Git permits info/exclude to be a symlink (often to a shared file).
+        # Serialize through our own no-follow lock, then open the actual Git
+        # file normally so that supported configuration keeps working.
+        with exclusive_lock(exclude.parent / "codexspin-exclude.lock"):
+            with open(exclude, "a+") as fh:
+                fh.seek(0)
+                contents = fh.read()
+                pattern = "/.worktrees/"
+                if pattern not in contents.splitlines():
+                    fh.seek(0, os.SEEK_END)
+                    if contents and not contents.endswith("\n"):
+                        fh.write("\n")
+                    fh.write(pattern + "\n")
+                    fh.flush()
+    wt_path = str(wt_root / job_id)
+    if Path(wt_path).exists() or Path(wt_path).is_symlink():
+        raise SystemExit(f"codexspin: worktree path already exists: {wt_path}")
     branch = f"codexspin/{job_id}"
-    Path(wt_path).parent.mkdir(parents=True, exist_ok=True)
     added = git(repo_root, "worktree", "add", "-b", branch, wt_path, "HEAD")
     if added.returncode != 0:
         raise SystemExit(f"codexspin: worktree add failed:\n{added.stderr.strip()}")
@@ -289,6 +365,8 @@ def _create_job(args) -> str:
         "phase": "starting",
         "cwd": cwd,
         "sandbox": sandbox,
+        "generation": 1,
+        "attention_tracked": True,
         "prompt_preview": " ".join(prompt.split())[:120],
         "started_at": time.time(),
         "activity": "launching runner",
@@ -370,25 +448,101 @@ PHASE_GLYPH = {
     "timeout": ("⏱", "yellow"),
 }
 STALE_SECONDS = 180
+ATTENTION_STATES = frozenset({"urgent", "quiet", "review"})
+ATTENTION_ORDER = {"urgent": 0, "quiet": 1, "review": 2}
 
 
 def _heartbeat_line(s: dict, now: float | None = None) -> tuple[str, bool]:
     # Cheap: one stat, never a full read. Age comes from events.jsonl mtime
     # (bumped on every appended notification); count is persisted in state by
     # the runner so status never rescans an append-only log.
+    now = time.time() if now is None else now
     try:
         stat = (job_dir(s["job_id"]) / "events.jsonl").stat()
     except OSError:
-        return "heartbeat: no events yet", False
-    if stat.st_size == 0:
+        stat = None
+    if stat is None or stat.st_size == 0:
+        age = int(max(0, now - (s.get("started_at") or now)))
+        if age > STALE_SECONDS:
+            quiet_age = f"{age // 60}m" if age < 3600 else f"{age // 3600}h"
+            return f"⚠ quiet {quiet_age} — no events yet", True
         return "heartbeat: no events yet", False
     event_count = s.get("event_count", 0)
-    age = int(max(0, (now if now is not None else time.time()) - stat.st_mtime))
+    # events.jsonl spans every resumed turn. A fresh turn starts healthy even
+    # when the previous turn's last event is old.
+    baseline = max(stat.st_mtime, s.get("started_at") or 0)
+    age = int(max(0, now - baseline))
     if age > STALE_SECONDS:
         quiet_age = f"{age // 60}m" if age < 3600 else f"{age // 3600}h"
         return (f"⚠ quiet {quiet_age} — last event {age}s ago · "
                 f"{event_count} events"), True
     return f"heartbeat: last event {age}s ago · {event_count} events", False
+
+
+def _is_quiet(s: dict, now: float | None = None) -> bool:
+    """Whether a live job has gone longer than the heartbeat threshold."""
+    return _heartbeat_line(s, now)[1]
+
+
+def attention_state(s: dict, now: float | None = None) -> tuple[str, float | None]:
+    """Derive presentation attention without changing execution phase.
+
+    Terminal failures and successful completions need acknowledgement once per
+    turn. Live jobs are either working or quiet. Cancelled and acknowledged
+    terminal jobs are seen.
+    """
+    phase = s.get("phase")
+    attention = attention_record(s["job_id"])
+    seen_at = attention.get("viewed_at")
+    if not isinstance(seen_at, (int, float)):
+        seen_at = None
+    if phase not in TERMINAL_PHASES:
+        return ("quiet" if _is_quiet(s, now) else "working"), seen_at
+    # Jobs created before attention tracking existed should not flood the
+    # first inbox after an upgrade. Resuming one stamps attention_tracked and
+    # its next completion becomes visible normally.
+    if not s.get("attention_tracked") and not attention:
+        return "seen", seen_at
+    if is_archived(s):
+        return "seen", seen_at
+    generation = s.get("generation")
+    viewed_generation = attention.get("viewed_generation")
+    if isinstance(generation, int) and not isinstance(generation, bool):
+        unseen = (not isinstance(viewed_generation, int)
+                  or isinstance(viewed_generation, bool)
+                  or generation > viewed_generation)
+    elif phase != "died" and isinstance(s.get("turn_id"), str):
+        unseen = attention.get("viewed_turn_id") != s["turn_id"]
+    else:
+        # Legacy jobs created before generation counters use timestamps as a
+        # best-effort fallback. New jobs and every resumed turn are generation
+        # based, which remains correct across host clock skew.
+        finished_at = s.get("finished_at")
+        viewed_finished_at = attention.get("viewed_result_finished_at")
+        if isinstance(finished_at, (int, float)):
+            unseen = (not isinstance(viewed_finished_at, (int, float))
+                      or finished_at > viewed_finished_at)
+        else:
+            markers = [value for value in (
+                viewed_finished_at, attention.get("viewed_run_started_at"),
+            ) if isinstance(value, (int, float))]
+            current_started_at = s.get("started_at")
+            unseen = (not markers or not isinstance(current_started_at, (int, float))
+                      or current_started_at > max(markers))
+    if unseen and phase in {"failed", "died", "timeout"}:
+        return "urgent", seen_at
+    if unseen and phase == "done":
+        return "review", seen_at
+    return "seen", seen_at
+
+
+def _with_attention(s: dict, now: float | None = None) -> dict:
+    annotated = dict(s)
+    attention, seen_at = attention_state(s, now)
+    annotated["attention"] = attention
+    if seen_at is not None:
+        annotated["viewed_at"] = seen_at
+    return annotated
 
 
 def _terminal_reason(s: dict) -> str:
@@ -423,6 +577,16 @@ def styled_sandbox(st: Style, sandbox: str) -> str:
     return st.green(sandbox or "?")
 
 
+def styled_attention(st: Style, attention: str | None) -> str:
+    if attention == "urgent":
+        return st.red(st.bold("urgent"))
+    if attention == "quiet":
+        return st.yellow("quiet")
+    if attention == "review":
+        return st.green("review")
+    return ""
+
+
 def quota_line(st: Style, quota: dict, fancy: bool) -> str:
     mins = quota.get("window_mins") or 0
     if mins >= 1440:
@@ -455,6 +619,9 @@ def print_job_fancy(st: Style, s: dict, width: int) -> None:
     if s.get("model"):
         model_effort = f"{s['model']}/{s.get('effort', '?')}"
         head += f"  {st.dim(model_effort)}"
+    attention = styled_attention(st, s.get("attention"))
+    if attention:
+        head += f"  [{attention}]"
     print(head)
     print(f"  {st.dim(s.get('prompt_preview', '')[:width - 4])}")
     if not finished:
@@ -486,6 +653,8 @@ def print_job_plain(s: dict, width: int = 120) -> None:
     )
     if s.get("model"):
         line += f"  {s['model']}/{s.get('effort', '?')}"
+    if s.get("attention") in ATTENTION_STATES:
+        line += f"  [{s['attention']}]"
     print(line)
     print(f"  {s.get('prompt_preview', '')}")
     if s.get("phase") not in TERMINAL_PHASES:
@@ -513,7 +682,11 @@ def _other_sessions_line(others: list[dict]) -> str:
             f" — codexspin status --all-sessions")
 
 
-def cmd_status(args) -> int:
+def _working_line(count: int) -> str:
+    return f"+ {count} working job{'s' if count != 1 else ''} — codexspin status"
+
+
+def _status_states(args) -> tuple[list[dict], list[dict], int]:
     others: list[dict] = []
     if args.job:
         # Explicit job id: cross-session escape hatch, never filtered.
@@ -521,6 +694,10 @@ def cmd_status(args) -> int:
     else:
         states = list_jobs()
         if not args.all:
+            states = [s for s in states if not is_archived(s)]
+        # Attention is an inbox, so unseen old results must not disappear at
+        # the normal 24-hour status cutoff.
+        if not args.all and not args.attention:
             cutoff = time.time() - 24 * 3600
             states = [s for s in states
                       if s.get("phase") not in TERMINAL_PHASES or (s.get("started_at") or 0) > cutoff]
@@ -528,14 +705,42 @@ def cmd_status(args) -> int:
         if session:
             others = [s for s in states if owned_by_other_session(s, session)]
             states = [s for s in states if not owned_by_other_session(s, session)]
+
+    now = time.time()
+    states = [_with_attention(s, now) for s in states]
+    others = [_with_attention(s, now) for s in others]
+    working = sum(1 for s in states if s["attention"] == "working")
+    if args.attention:
+        states = [s for s in states if s["attention"] in ATTENTION_STATES]
+        states.sort(key=lambda s: ATTENTION_ORDER[s["attention"]])
+        # Keep foreign-session summaries useful without counting acknowledged
+        # terminal history that attention mode intentionally hides.
+        others = [s for s in others
+                  if s["attention"] in ATTENTION_STATES or s["attention"] == "working"]
+    return states, others, working
+
+
+def _print_status_once(args) -> int:
+    states, others, working = _status_states(args)
     if args.json:
         print(json.dumps(states, indent=2))
         return 0
     if not states:
+        printed = False
+        if args.attention and working:
+            print(_working_line(working))
+            printed = True
         if others:
+            if printed:
+                print()
             print(_other_sessions_line(others))
             return 0
-        print("no jobs (use --all to include old finished jobs)")
+        if printed:
+            return 0
+        if args.attention:
+            print("no jobs need attention")
+        else:
+            print("no jobs (use --all to include old finished jobs)")
         return 0
     fancy = use_color()
     st = Style(fancy)
@@ -545,44 +750,102 @@ def cmd_status(args) -> int:
             print_job_fancy(st, s, width)
         else:
             print_job_plain(s, width)
+    if args.attention and working:
+        prefix = "" if fancy else "\n"
+        print(f"{prefix}{st.gray(_working_line(working))}")
     # Quota is account-wide: hidden foreign jobs stay eligible for the freshest
     # snapshot even though their details are not rendered.
     quota = None
-    for s in [*states, *others]:
-        q = s.get("quota")
-        if q and (quota is None or (q.get("at") or 0) > (quota.get("at") or 0)):
-            quota = q
-    if quota:
-        prefix = "" if fancy else "\n"
-        print(f"{prefix}{quota_line(st, quota, fancy)}")
+    if not args.attention:
+        for s in [*states, *others]:
+            q = s.get("quota")
+            if q and (quota is None or (q.get("at") or 0) > (quota.get("at") or 0)):
+                quota = q
+        if quota:
+            prefix = "" if fancy else "\n"
+            print(f"{prefix}{quota_line(st, quota, fancy)}")
     if others:
         prefix = "" if fancy else "\n"
         print(f"{prefix}{st.gray(_other_sessions_line(others))}")
     return 0
 
 
+def cmd_status(args) -> int:
+    if args.watch and args.json:
+        raise SystemExit("codexspin: --watch cannot be combined with --json")
+    if not args.watch:
+        return _print_status_once(args)
+
+    first = True
+    try:
+        while True:
+            if sys.stdout.isatty():
+                print("\033[H\033[2J", end="")
+            elif not first:
+                print("\n---")
+            _print_status_once(args)
+            sys.stdout.flush()
+            first = False
+            time.sleep(1)
+    except KeyboardInterrupt:
+        return 130
+
+
 def cmd_result(args) -> int:
     job_id = resolve_job_id(args.job)
-    result = read_json(job_dir(job_id) / "result.json")
-    state = load_state(job_id)
-    if result is None:
+    jd = job_dir(job_id)
+    # Serialize with send's result invalidation + runner launch. Otherwise a
+    # transient state carrying the prior dead runner PID can look synthesized-
+    # died and acknowledge a generation that is actually about to run.
+    with exclusive_lock(jd / "cli.lock"):
+        result = read_json(jd / "result.json")
+        state = load_state(job_id)
         phase = (state or {}).get("phase", "unknown")
+        # Runner.finish writes result.json before publishing terminal state.
+        # If completion landed between our two reads, pick up and present that
+        # result instead of acknowledging a resultless outcome.
+        if result is None and phase in TERMINAL_PHASES:
+            result = read_json(jd / "result.json")
+        if result is None and phase in TERMINAL_PHASES:
+            # Keep this under cli.lock: otherwise a concurrent send can start
+            # a new runner and make old-death compaction wait for its full turn.
+            compact_terminal_events(job_id)
+    if result is None:
         print(f"codexspin: {job_id} has no result yet (phase: {phase})", file=sys.stderr)
+        sys.stderr.flush()
+        # A synthesized died state may have no result.json. Acknowledge only
+        # after its human-facing output was successfully delivered.
+        if phase in TERMINAL_PHASES:
+            mark_viewed(
+                job_id,
+                generation=(state or {}).get("generation"),
+                turn_id=(state or {}).get("turn_id"),
+                result_finished_at=(state or {}).get("finished_at"),
+                run_started_at=(state or {}).get("started_at"),
+            )
         return 3
     if args.json:
         print(json.dumps(result, indent=2))
-        return 0 if result["phase"] == "done" else 1
-    print(f"# {job_id} — {result['phase']}")
-    if result.get("duration_ms"):
-        print(f"duration: {fmt_elapsed(result['duration_ms'] / 1000)}  commands: {result.get('command_count', 0)}")
-    if result.get("touched_files"):
-        print("touched files:")
-        for f in result["touched_files"]:
-            print(f"  {f}")
-    if result.get("error"):
-        print(f"error: {result['error'].get('message', '')}")
-    print()
-    print(result.get("final_message") or "(no final message)")
+    else:
+        print(f"# {job_id} — {result['phase']}")
+        if result.get("duration_ms"):
+            print(f"duration: {fmt_elapsed(result['duration_ms'] / 1000)}  commands: {result.get('command_count', 0)}")
+        if result.get("touched_files"):
+            print("touched files:")
+            for f in result["touched_files"]:
+                print(f"  {f}")
+        if result.get("error"):
+            print(f"error: {result['error'].get('message', '')}")
+        print()
+        print(result.get("final_message") or "(no final message)")
+    sys.stdout.flush()
+    mark_viewed(
+        job_id,
+        generation=result.get("generation"),
+        turn_id=result.get("turn_id"),
+        result_finished_at=result.get("finished_at"),
+        run_started_at=result.get("started_at"),
+    )
     return 0 if result["phase"] == "done" else 1
 
 
@@ -617,8 +880,7 @@ def cmd_send(args) -> int:
     jd = job_dir(job_id)
     # Exclusive lock over check-then-launch: two concurrent sends must not
     # put two runners on the same thread.
-    with open(jd / "cli.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with exclusive_lock(jd / "cli.lock"):
         state = load_state(job_id) or {}
         if state.get("phase") not in TERMINAL_PHASES:
             raise SystemExit(f"codexspin: {job_id} is still {state.get('phase', 'unknown')}; await or cancel it first")
@@ -630,9 +892,15 @@ def cmd_send(args) -> int:
         # Invalidate the previous turn's result so `result` reports "no result
         # yet" during the new turn; history stays in results.jsonl.
         (jd / "result.json").unlink(missing_ok=True)
+        generation = state.get("generation")
+        generation = generation if isinstance(generation, int) and generation > 0 else 0
         state.update(phase="starting", activity="resuming thread",
+                     generation=generation + 1,
+                     attention_tracked=True,
                      prompt_preview=" ".join(prompt.split())[:120], started_at=time.time())
         state.pop("finished_at", None)
+        state.pop("turn_id", None)
+        state.pop("runner_pid", None)
         write_json(jd / "state.json", state)
         pid = launch_runner(jd, resume=True)
         state["runner_pid"] = pid
@@ -702,8 +970,7 @@ def command_error(prefix: str, result: subprocess.CompletedProcess) -> SystemExi
 
 def cmd_handoff(args) -> int:
     job_id = resolve_job_id(args.job)
-    with open(job_dir(job_id) / "cli.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with exclusive_lock(job_dir(job_id) / "cli.lock"):
         return _handoff_locked(args, job_id)
 
 
@@ -720,7 +987,7 @@ def _handoff_locked(args, job_id: str) -> int:
                          "wait for it to start or cancel it yourself")
 
     if state.get("phase") not in TERMINAL_PHASES:
-        cmd_cancel(argparse.Namespace(job=job_id, hard=False))
+        _cancel_locked(argparse.Namespace(job=job_id, hard=False), job_id)
         state = load_state(job_id) or {}
     if state.get("phase") not in TERMINAL_PHASES:
         raise SystemExit(f"codexspin: {job_id} did not reach a terminal phase after cancellation")
@@ -795,14 +1062,22 @@ def _handoff_locked(args, job_id: str) -> int:
 
 def cmd_cancel(args) -> int:
     job_id = resolve_job_id(args.job)
+    with exclusive_lock(job_dir(job_id) / "cli.lock"):
+        return _cancel_locked(args, job_id)
+
+
+def _cancel_locked(args, job_id: str) -> int:
     state = load_state(job_id) or {}
     pid = state.get("runner_pid")
     if state.get("phase") in TERMINAL_PHASES or not pid:
+        if state.get("phase") in TERMINAL_PHASES:
+            compact_terminal_events(job_id)
         print(f"codexspin: {job_id} is not running (phase: {state.get('phase', 'unknown')})")
         return 0
     if not pid_is_runner(pid):
         state.update(phase="died", activity="runner gone before cancel", finished_at=time.time())
         write_json(job_dir(job_id) / "state.json", state)
+        compact_terminal_events(job_id)
         print(f"codexspin: {job_id} runner already gone; marked died")
         return 0
     try:
@@ -815,7 +1090,7 @@ def cmd_cancel(args) -> int:
     # Wait briefly for the runner to write a terminal state; if it died
     # without one (e.g. SIGTERM landed during interpreter startup), record
     # the cancellation ourselves so the job doesn't linger as "died".
-    deadline = time.time() + (0 if args.hard else 6)
+    deadline = time.time() + (2 if args.hard else 6)
     while time.time() < deadline:
         state = load_state(job_id) or {}
         if state.get("phase") in TERMINAL_PHASES:
@@ -825,6 +1100,7 @@ def cmd_cancel(args) -> int:
     if state.get("phase") not in ("done", "failed", "cancelled"):
         state.update(phase="cancelled", activity="killed", finished_at=time.time())
         write_json(job_dir(job_id) / "state.json", state)
+    compact_terminal_events(job_id)
     print(f"cancelled {job_id}")
     return 0
 
@@ -869,10 +1145,39 @@ def _describe_event(msg: dict) -> str | None:
 def cmd_logs(args) -> int:
     job_id = resolve_job_id(args.job)
     events = job_dir(job_id) / "events.jsonl"
-    if not events.exists():
+    rotated = events.with_name(events.name + ".1")
+    contents = None
+    # Rotation uses atomic renames. Retry a changing snapshot rather than
+    # blocking live `logs` behind the runner's lifetime event-log lock.
+    for _attempt in range(3):
+        paths = [path for path in (rotated, events) if path.exists()]
+        try:
+            before = [(path, path.stat().st_ino, path.stat().st_size,
+                       path.stat().st_mtime_ns) for path in paths]
+            candidate = [(path, path.read_text()) for path in paths]
+            after = [(path, path.stat().st_ino, path.stat().st_size,
+                      path.stat().st_mtime_ns) for path in paths]
+        except OSError:
+            continue
+        if before == after:
+            contents = candidate
+            break
+    if contents is None:
+        contents = []
+        for path in (rotated, events):
+            try:
+                contents.append((path, path.read_text()))
+            except OSError:
+                continue
+    if not contents:
         print("(no events yet)")
         return 0
-    lines = events.read_text().splitlines()[-args.lines:]
+    lines = []
+    for _path, content in reversed(contents):
+        lines[0:0] = content.splitlines()[-args.lines:]
+        if len(lines) >= args.lines:
+            lines = lines[-args.lines:]
+            break
     for line in lines:
         if args.json:
             print(line)
@@ -885,6 +1190,54 @@ def cmd_logs(args) -> int:
         if desc is not None:
             print(desc)
     return 0
+
+
+def cmd_archive(args) -> int:
+    archived = 0
+    for prefix in args.job:
+        job_id = resolve_job_id(prefix)
+        jd = job_dir(job_id)
+        with exclusive_lock(jd / "cli.lock"):
+            state = load_state(job_id) or {}
+            if state.get("phase") not in TERMINAL_PHASES:
+                print(f"codexspin: {job_id} is {state.get('phase', 'unknown')}, not archiving")
+                continue
+            # Existing pre-cap jobs can be large. Archive keeps the structured
+            # result and native resume id, but reduces raw diagnostics to the
+            # same bounded terminal tail as newly completed jobs.
+            compact_terminal_events(job_id)
+            mark_viewed(
+                job_id,
+                generation=state.get("generation"),
+                turn_id=state.get("turn_id"),
+                result_finished_at=state.get("finished_at"),
+                run_started_at=state.get("started_at"),
+            )
+            mark_archived(
+                job_id,
+                generation=state.get("generation"),
+                result_finished_at=state.get("finished_at"),
+            )
+            archived += 1
+            print(f"archived {job_id}")
+    return 0 if archived == len(args.job) else 1
+
+
+def compact_terminal_events(job_id: str) -> bool:
+    """Apply the terminal cap when no runner still owns the active log.
+
+    Returns False instead of waiting behind a stuck runner. Live logs are
+    already bounded, and a runner that eventually exits compacts in finally.
+    Callers serialize this check with send through cli.lock.
+    """
+    from .runner import BoundedEventLog
+
+    state = read_json(job_dir(job_id) / "state.json") or {}
+    if pid_is_runner(state.get("runner_pid")):
+        return False
+    event_log = BoundedEventLog(job_dir(job_id))
+    event_log.close(terminal=True)
+    return True
 
 
 def remove_worktree(state: dict) -> bool:
@@ -1034,6 +1387,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--all-sessions", action="store_true",
                    help="include jobs owned by other Claude sessions "
                         "(default when not inside a Claude session)")
+    p.add_argument("--attention", action="store_true",
+                   help="show urgent, quiet, and completed-unseen jobs plus a working count")
+    p.add_argument("--watch", action="store_true",
+                   help="refresh status every second until interrupted")
     p.add_argument("--json", action="store_true")
     _add_host_argument(p)
     p.set_defaults(fn=cmd_status)
@@ -1085,6 +1442,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="print raw event JSON instead of readable lines")
     _add_host_argument(p)
     p.set_defaults(fn=cmd_logs)
+
+    p = sub.add_parser("archive", help="hide finished jobs without deleting resume metadata")
+    p.add_argument("job", nargs="+", help="finished job id(s) to archive")
+    _add_host_argument(p)
+    p.set_defaults(fn=cmd_archive)
 
     p = sub.add_parser("doctor", help="check codex binary, app-server handshake, auth, defaults")
     _add_host_argument(p)

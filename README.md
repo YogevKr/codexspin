@@ -38,6 +38,8 @@ codexspin spawn -w -n fix-c --max-minutes 30 "Refactor the dispatcher..."
 
 codexspin status              # running + last 24h (--all for everything;
                               # --all-sessions to include other Claude sessions' jobs)
+codexspin status --attention  # urgent/quiet/unseen results + compact working count
+codexspin status --watch      # refresh the fleet view every second
 codexspin run "..."          # foreground: spawn + wait + print (one job you'll watch)
 codexspin await JOB [JOB...]  # block until done, print results
 codexspin result JOB [--json]
@@ -46,6 +48,7 @@ codexspin transfer [--source CLAUDE_JSONL]  # Claude Code session -> resumable C
 codexspin handoff JOB HOST ["continue on the remote"]
 codexspin cancel JOB [--hard]
 codexspin logs JOB
+codexspin archive JOB [JOB…] # hide jobs; compact events; preserve result + resume
 codexspin doctor              # codex binary / app-server / auth / defaults
 codexspin gc [JOB…]           # this project by default; JOB ids or --everywhere to widen; --dry-run
 ```
@@ -53,7 +56,7 @@ codexspin gc [JOB…]           # this project by default; JOB ids or --everywhe
 ## Remote hosts
 
 Add `--host NAME` to `spawn`, `status`, `result`, `await`, `send`, `cancel`,
-`logs`, `doctor`, or `gc` to run that same command on another machine:
+`logs`, `archive`, `doctor`, or `gc` to run that same command on another machine:
 
 ```sh
 codexspin spawn --host buildbox -C /srv/project "Fix the failing integration test"
@@ -75,8 +78,13 @@ Job ids accept unambiguous prefixes. Every job records the codex thread id, so
 `codex resume <thread-id>` drops you into the same session interactively.
 
 - `-w/--worktree` runs the job in a fresh git worktree
-  (`~/.codexspin/worktrees/<job-id>`, branch `codexspin/<job-id>`) so parallel
-  jobs never fight over the tree. The worktree's git metadata dir is added to
+  (`<repo>/.worktrees/<job-id>`, branch `codexspin/<job-id>`) so parallel jobs
+  never fight over the tree. CodexSpin adds `/.worktrees/` to the repository's
+  local `.git/info/exclude`; it does not edit the tracked `.gitignore`. The
+  primary checkout owns this directory even when spawning from a linked
+  worktree. Repositories with a bare common Git directory have no primary
+  checkout, so CodexSpin uses a sibling `.worktrees/` directory instead. The
+  worktree's git metadata dir is added to
   the job's sandbox writable roots (per-job app-server `-c` override), so the
   job can `git commit` its own work — tell it to. `gc` removes only clean
   worktrees — committed work survives on the branch, uncommitted work keeps
@@ -84,6 +92,17 @@ Job ids accept unambiguous prefixes. Every job records the codex thread id, so
 - `--max-minutes N` interrupts a runaway job (phase `timeout`).
 - `status` shows each job's resolved model/effort and the latest ChatGPT
   quota reading (`account/rateLimits/updated` pushed by the app-server).
+- Attention is presentation state, separate from the runner-owned execution
+  phase: failed/died/timeout jobs are `urgent`, stale live jobs are `quiet`,
+  and completed-unseen jobs need `review`. Printing a result via `result`,
+  `run`, `await`, or `send --wait` acknowledges that turn in a separate
+  `attention.json` sidecar. `status --attention` never drops unseen results at
+  the normal 24-hour cutoff. Jobs created before attention tracking are
+  treated as already seen on upgrade. `archive` hides a terminal generation
+  from normal and attention views and compacts raw events to the 1 MB terminal
+  tail while preserving its structured results and native Codex resume ID.
+  `status --all`, `result`, and `send` still work, and a resumed generation
+  becomes visible.
 - Jobs spawned inside a Claude Code session are tagged with that session's id
   (from `CLAUDE_CODE_SESSION_ID`). Inside a session, `status` shows that
   session's jobs plus untagged ones and collapses other sessions' jobs into a
@@ -97,8 +116,11 @@ Job ids accept unambiguous prefixes. Every job records the codex thread id, so
 - `spawn` double-forks a detached runner (`codexspin.runner`) per job — no
   shared broker, no tmux; a dead runner is always detected (phase `died`).
 - The runner owns one `codex app-server` process, starts a persistent thread
-  (`approvalPolicy: never`, your chosen sandbox), streams every notification
-  to `events.jsonl`, and keeps `state.json` fresh (phase, activity, thread id).
+  (`approvalPolicy: never`, your chosen sandbox), streams notifications to a
+  two-segment `events.jsonl` capped at 10 MB while active, compacts it to a
+  1 MB diagnostic tail at completion, and keeps `state.json` fresh (phase,
+  activity, thread id). Oversized individual notifications are represented by
+  a small truncation marker; result extraction still uses the live event.
 - Terminal result (final message, touched files, command count, duration)
   lands in `result.json`; turn history accrues in `results.jsonl`.
 - State lives under `~/.codexspin/jobs/<job-id>/` (`CODEXSPIN_HOME` overrides).
@@ -134,7 +156,9 @@ Environment variables: `CODEXSPIN_HOME` (state root, default `~/.codexspin`),
 fake), `CODEXSPIN_SSH_BIN` (ssh transport override, default `ssh`),
 `CODEXSPIN_RSYNC_BIN` (rsync transport override, default `rsync`), and
 `CODEXSPIN_STARTUP_TIMEOUT` (seconds to wait for app-server responses
-during startup, default 180). Session transfer also supports
+during startup, default 180). `CODEXSPIN_EVENTS_MAX_BYTES` controls the active
+event-log cap (default 10000000); `CODEXSPIN_EVENTS_TERMINAL_BYTES` controls
+the completed-job tail (default 1000000). Session transfer also supports
 `CODEXSPIN_TRANSFER_TIMEOUT` (seconds to wait for the native import, default
 120).
 

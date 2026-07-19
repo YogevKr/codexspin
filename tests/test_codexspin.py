@@ -13,7 +13,7 @@ import pytest
 
 from codexspin import cli, jobs
 from codexspin.appserver import AppServerClient, AppServerError
-from codexspin.runner import Runner
+from codexspin.runner import BoundedEventLog, Runner
 
 FAKE = str(Path(__file__).parent / "fake_codex.py")
 FAKE_SSH = str(Path(__file__).parent / "fake_ssh.py")
@@ -122,6 +122,14 @@ def test_remote_spawn_status_and_prompt_round_trip(capfd, monkeypatch, tmp_path)
     assert remote_tokens == ["codexspin", "send", job_id, "-"]
     wait_remote_terminal(remote_home, job_id)
     assert json.loads(spec_path.read_text())["prompt"] == follow_up
+
+
+def test_remote_watch_interrupt_returns_130(monkeypatch):
+    def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.subprocess, "run", interrupted)
+    assert cli.main(["status", "--host", "testbox", "--watch"]) == 130
 
 
 def test_remote_result_preserves_failed_exit_code(capfd, monkeypatch):
@@ -269,6 +277,66 @@ def test_cancel(capsys, monkeypatch):
     assert state["phase"] == "cancelled"
 
 
+def test_hard_cancel_compacts_active_event_log(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "slow")
+    job_id = spawn(capsys, "-n", "hard-compact")
+    events = wait_running_with_events(job_id)
+    with open(events, "a") as fh:
+        for _ in range(700):
+            fh.write(json.dumps({"method": "old", "params": {"text": "x" * 2000}}) + "\n")
+    assert events.stat().st_size > 1_000_000
+
+    assert cli.main(["cancel", job_id, "--hard"]) == 0
+    capsys.readouterr()
+    paths = [events.with_name("events.jsonl.1"), events]
+    assert sum(path.stat().st_size for path in paths if path.exists()) <= 1_000_000
+
+
+def test_cancel_serializes_terminal_compaction_with_send(capsys, monkeypatch):
+    job_id = spawn(capsys, "-n", "cancel-send-lock")
+    wait_terminal(job_id)
+    compacting = threading.Event()
+    release = threading.Event()
+    real_compact = cli.compact_terminal_events
+
+    def blocked_compact(target):
+        compacting.set()
+        assert release.wait(2)
+        real_compact(target)
+
+    monkeypatch.setattr(cli, "compact_terminal_events", blocked_compact)
+    cancel_thread = threading.Thread(
+        target=lambda: cli.main(["cancel", job_id]), daemon=True,
+    )
+    cancel_thread.start()
+    assert compacting.wait(1)
+    send_thread = threading.Thread(
+        target=lambda: cli.main(["send", job_id, "resume after cancel"]), daemon=True,
+    )
+    send_thread.start()
+    time.sleep(0.1)
+    assert send_thread.is_alive()
+    release.set()
+    cancel_thread.join(timeout=2)
+    send_thread.join(timeout=2)
+    assert not cancel_thread.is_alive()
+    assert not send_thread.is_alive()
+    capsys.readouterr()
+    wait_terminal(job_id)
+
+
+def test_terminal_compaction_skips_live_runner_without_waiting(capsys, monkeypatch):
+    job_id = spawn(capsys, "-n", "live-compact-skip")
+    wait_terminal(job_id)
+    monkeypatch.setattr(cli, "pid_is_runner", lambda _pid: True)
+
+    def should_not_open(_path):
+        raise AssertionError("must not wait on live runner event lock")
+
+    monkeypatch.setattr("codexspin.runner.BoundedEventLog", should_not_open)
+    assert cli.compact_terminal_events(job_id) is False
+
+
 def test_running_status_shows_recent_heartbeat(capsys, monkeypatch):
     monkeypatch.setenv("FAKE_MODE", "slow")
     job_id = spawn(capsys)
@@ -290,8 +358,18 @@ def test_running_status_warns_when_heartbeat_is_quiet(capsys, monkeypatch):
     job_id = spawn(capsys)
     try:
         events_path = wait_running_with_events(job_id)
+        # The fake emits a short startup burst before going quiet. Age the log
+        # only after that burst, or its final notification refreshes mtime.
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if (jobs.load_state(job_id) or {}).get("event_count", 0) >= 3:
+                break
+            time.sleep(0.05)
         stale_time = time.time() - cli.STALE_SECONDS - 60
         os.utime(events_path, (stale_time, stale_time))
+        state = jobs.read_json(jobs.job_dir(job_id) / "state.json")
+        state["started_at"] = stale_time
+        jobs.write_json(jobs.job_dir(job_id) / "state.json", state)
         cli.main(["status", job_id])
         out = capsys.readouterr().out
         assert "⚠ quiet" in out
@@ -307,6 +385,527 @@ def test_failed_status_shows_reason_inline(capsys, monkeypatch):
     assert wait_terminal(job_id)["phase"] == "failed"
     cli.main(["status", job_id])
     assert "reason: fake model exploded" in capsys.readouterr().out
+
+
+def test_attention_status_tracks_unseen_result_and_result_marks_viewed(capsys):
+    job_id = spawn(capsys, "-n", "review-me")
+    state_before = wait_terminal(job_id)
+
+    cli.main(["status", "--attention"])
+    out = capsys.readouterr().out
+    assert job_id in out
+    assert "[review]" in out
+    assert jobs.viewed_at(job_id) is None
+
+    assert cli.main(["result", job_id]) == 0
+    capsys.readouterr()
+    assert jobs.viewed_at(job_id) is not None
+    # Acknowledgement is CLI-owned and must not leak into runner state.
+    assert jobs.read_json(jobs.job_dir(job_id) / "state.json") == state_before
+
+    cli.main(["status", "--attention"])
+    assert capsys.readouterr().out.strip() == "no jobs need attention"
+
+
+def test_attention_failure_is_urgent_until_result_is_viewed(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "fail")
+    job_id = spawn(capsys, "-n", "urgent")
+    assert wait_terminal(job_id)["phase"] == "failed"
+
+    cli.main(["status", "--attention"])
+    out = capsys.readouterr().out
+    assert job_id in out and "[urgent]" in out
+
+    assert cli.main(["result", job_id]) == 1
+    capsys.readouterr()
+    cli.main(["status", "--attention"])
+    assert capsys.readouterr().out.strip() == "no jobs need attention"
+
+
+def test_attention_view_of_prior_turn_does_not_hide_resumed_runner_death(capsys):
+    job_id = spawn(capsys, "-n", "resume-dies")
+    wait_terminal(job_id)
+    assert cli.main(["result", job_id]) == 0
+    capsys.readouterr()
+    result = jobs.read_json(jobs.job_dir(job_id) / "result.json")
+
+    state = jobs.read_json(jobs.job_dir(job_id) / "state.json")
+    state.update(
+        phase="running",
+        generation=result["generation"] + 1,
+        started_at=result["finished_at"] + 1,
+        runner_pid=999_999_999,
+    )
+    state.pop("finished_at", None)
+    state.pop("turn_id", None)
+    jobs.write_json(jobs.job_dir(job_id) / "state.json", state)
+
+    cli.main(["status", "--attention"])
+    out = capsys.readouterr().out
+    assert job_id in out and "died" in out and "[urgent]" in out
+
+
+def test_result_acknowledges_persisted_resultless_death(capsys):
+    job_id = spawn(capsys, "-n", "resultless-death")
+    wait_terminal(job_id)
+    result = jobs.read_json(jobs.job_dir(job_id) / "result.json")
+    (jobs.job_dir(job_id) / "result.json").unlink()
+    state = jobs.read_json(jobs.job_dir(job_id) / "state.json")
+    state.update(phase="died", finished_at=result["finished_at"] + 1)
+    jobs.write_json(jobs.job_dir(job_id) / "state.json", state)
+
+    cli.main(["status", "--attention"])
+    assert "[urgent]" in capsys.readouterr().out
+    assert cli.main(["result", job_id]) == 3
+    capsys.readouterr()
+    cli.main(["status", "--attention"])
+    assert capsys.readouterr().out.strip() == "no jobs need attention"
+
+
+def test_result_rereads_completion_published_before_terminal_state(capsys, monkeypatch):
+    job_id = spawn(capsys, "-n", "result-race")
+    wait_terminal(job_id)
+    real_read_json = cli.read_json
+    first_result_read = True
+
+    def delayed_result(path):
+        nonlocal first_result_read
+        if path.name == "result.json" and first_result_read:
+            first_result_read = False
+            return None
+        return real_read_json(path)
+
+    monkeypatch.setattr(cli, "read_json", delayed_result)
+    assert cli.main(["result", job_id]) == 0
+    assert "FAKE-DONE" in capsys.readouterr().out
+    cli.main(["status", "--attention"])
+    assert capsys.readouterr().out.strip() == "no jobs need attention"
+
+
+def test_result_does_not_acknowledge_failed_output(capsys, monkeypatch):
+    job_id = spawn(capsys, "-n", "broken-output")
+    wait_terminal(job_id)
+
+    class BrokenOutput:
+        def write(self, _text):
+            raise OSError("output closed")
+
+        def flush(self):
+            pass
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(sys, "stdout", BrokenOutput())
+        with pytest.raises(OSError, match="output closed"):
+            cli.main(["result", job_id])
+    assert jobs.viewed_at(job_id) is None
+    cli.main(["status", "--attention"])
+    assert job_id in capsys.readouterr().out
+
+
+def test_late_old_result_acknowledgement_cannot_hide_newer_result(capsys):
+    job_id = spawn(capsys, "-n", "ack-race")
+    wait_terminal(job_id)
+    old_result = jobs.read_json(jobs.job_dir(job_id) / "result.json")
+    assert cli.main(["result", job_id]) == 0
+    capsys.readouterr()
+
+    state = jobs.read_json(jobs.job_dir(job_id) / "state.json")
+    state.update(
+        phase="done",
+        generation=old_result["generation"] + 1,
+        turn_id="newer-turn",
+        started_at=old_result["finished_at"] + 1,
+        finished_at=old_result["finished_at"] + 2,
+    )
+    jobs.write_json(jobs.job_dir(job_id) / "state.json", state)
+    # Simulate a delayed cmd_result that displayed only the prior turn.
+    jobs.mark_viewed(
+        job_id,
+        generation=old_result["generation"],
+        turn_id=old_result["turn_id"],
+        result_finished_at=old_result["finished_at"],
+        run_started_at=old_result["started_at"],
+        at=old_result["finished_at"] + 3,
+    )
+
+    cli.main(["status", "--attention"])
+    out = capsys.readouterr().out
+    assert job_id in out and "[review]" in out
+
+
+def test_attention_generation_survives_cross_host_clock_skew(capsys):
+    job_id = spawn(capsys, "-n", "clock-skew")
+    wait_terminal(job_id)
+    old_result = jobs.read_json(jobs.job_dir(job_id) / "result.json")
+    jobs.mark_viewed(
+        job_id,
+        generation=old_result["generation"],
+        turn_id=old_result["turn_id"],
+        result_finished_at=10_000,
+        run_started_at=9_000,
+        at=20_000,
+    )
+
+    # A remote host can be behind the source clock. Generation, not these
+    # smaller timestamps, must make the new completion visible.
+    state = jobs.read_json(jobs.job_dir(job_id) / "state.json")
+    state.update(
+        phase="done",
+        generation=old_result["generation"] + 1,
+        turn_id="remote-turn",
+        started_at=100,
+        finished_at=200,
+    )
+    jobs.write_json(jobs.job_dir(job_id) / "state.json", state)
+
+    cli.main(["status", "--attention"])
+    out = capsys.readouterr().out
+    assert job_id in out and "[review]" in out
+
+
+def test_attention_status_compacts_working_jobs_and_surfaces_quiet(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "slow")
+    job_id = spawn(capsys, "-n", "working")
+    try:
+        events_path = wait_running_with_events(job_id)
+        cli.main(["status", "--attention"])
+        out = capsys.readouterr().out.strip()
+        assert out == "+ 1 working job — codexspin status"
+
+        # The runner creates the file before the first notification. Empty logs
+        # must still become quiet if startup stalls.
+        events_path.write_text("")
+        state = jobs.read_json(jobs.job_dir(job_id) / "state.json")
+        state["started_at"] = time.time() - cli.STALE_SECONDS - 60
+        jobs.write_json(jobs.job_dir(job_id) / "state.json", state)
+        cli.main(["status", "--attention"])
+        out = capsys.readouterr().out
+        assert job_id in out and "[quiet]" in out
+        assert "no events yet" in out
+        assert "working job" not in out
+    finally:
+        cli.main(["cancel", job_id])
+        wait_terminal(job_id)
+
+
+def test_fresh_resume_ignores_prior_turn_event_age(capsys):
+    job_id = spawn(capsys, "-n", "fresh-resume")
+    wait_terminal(job_id)
+    events_path = jobs.job_dir(job_id) / "events.jsonl"
+    stale_time = time.time() - cli.STALE_SECONDS - 60
+    os.utime(events_path, (stale_time, stale_time))
+    state = jobs.read_json(jobs.job_dir(job_id) / "state.json")
+    state.update(
+        phase="starting",
+        generation=state["generation"] + 1,
+        started_at=time.time(),
+        activity="resuming thread",
+    )
+    state.pop("finished_at", None)
+    state.pop("runner_pid", None)
+    jobs.write_json(jobs.job_dir(job_id) / "state.json", state)
+
+    cli.main(["status", "--attention"])
+    assert capsys.readouterr().out.strip() == "+ 1 working job — codexspin status"
+
+
+def test_send_clears_stale_runner_pid_before_launch(capsys, monkeypatch):
+    job_id = spawn(capsys, "-n", "send-launch")
+    wait_terminal(job_id)
+    observed = {}
+
+    def fake_launch(jd, resume=False):
+        observed.update(jobs.read_json(jd / "state.json"))
+        assert resume is True
+        return 999_999_999
+
+    monkeypatch.setattr(cli, "launch_runner", fake_launch)
+    assert cli.main(["send", job_id, "again"]) == 0
+    capsys.readouterr()
+    assert observed["phase"] == "starting"
+    assert observed["generation"] == 2
+    assert "runner_pid" not in observed
+
+
+def test_attention_json_and_watch_modes(capsys, monkeypatch):
+    job_id = spawn(capsys, "-n", "json-review")
+    wait_terminal(job_id)
+    cli.main(["status", "--attention", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert [(item["job_id"], item["attention"]) for item in payload] == [
+        (job_id, "review"),
+    ]
+
+    with pytest.raises(SystemExit, match="--watch cannot be combined with --json"):
+        cli.main(["status", "--watch", "--json"])
+
+    def interrupt(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", interrupt)
+    assert cli.main(["status", "--attention", "--watch"]) == 130
+    assert job_id in capsys.readouterr().out
+
+
+def test_legacy_jobs_start_seen_but_resume_becomes_attention_aware(capsys):
+    job_id = spawn(capsys, "-n", "legacy")
+    wait_terminal(job_id)
+    state = jobs.read_json(jobs.job_dir(job_id) / "state.json")
+    state.pop("attention_tracked")
+    jobs.write_json(jobs.job_dir(job_id) / "state.json", state)
+
+    cli.main(["status", "--attention"])
+    assert capsys.readouterr().out.strip() == "no jobs need attention"
+
+    assert cli.main(["send", job_id, "new turn"]) == 0
+    capsys.readouterr()
+    wait_terminal(job_id)
+    cli.main(["status", "--attention"])
+    out = capsys.readouterr().out
+    assert job_id in out and "[review]" in out
+
+
+def test_archive_hides_job_but_preserves_result_and_resume(capsys):
+    job_id = spawn(capsys, "-n", "archive-me")
+    wait_terminal(job_id)
+
+    assert cli.main(["archive", job_id]) == 0
+    assert f"archived {job_id}" in capsys.readouterr().out
+    cli.main(["status"])
+    assert job_id not in capsys.readouterr().out
+    cli.main(["status", "--attention"])
+    assert capsys.readouterr().out.strip() == "no jobs need attention"
+    cli.main(["status", "--all"])
+    assert job_id in capsys.readouterr().out
+    assert cli.main(["result", job_id]) == 0
+    assert "FAKE-DONE" in capsys.readouterr().out
+    cli.main(["status"])
+    assert job_id not in capsys.readouterr().out
+
+    assert cli.main(["send", job_id, "continue"]) == 0
+    capsys.readouterr()
+    wait_terminal(job_id)
+    cli.main(["status", "--attention"])
+    out = capsys.readouterr().out
+    assert job_id in out and "[review]" in out
+
+
+def test_archive_compacts_legacy_event_log(capsys):
+    job_id = spawn(capsys, "-n", "compact-archive")
+    wait_terminal(job_id)
+    jd = jobs.job_dir(job_id)
+    (jd / "events.jsonl").write_text(
+        "".join(json.dumps({"method": "old", "params": {"text": "x" * 2000}}) + "\n"
+                for _ in range(700))
+    )
+    assert (jd / "events.jsonl").stat().st_size > 1_000_000
+
+    assert cli.main(["archive", job_id]) == 0
+    capsys.readouterr()
+    paths = [jd / "events.jsonl.1", jd / "events.jsonl"]
+    assert sum(path.stat().st_size for path in paths if path.exists()) <= 1_000_000
+    assert jobs.read_json(jd / "result.json")["thread_id"] == "fake-thread-0001"
+
+
+def test_archive_refuses_live_job(capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "slow")
+    job_id = spawn(capsys, "-n", "live-archive")
+    try:
+        wait_running_with_events(job_id)
+        assert cli.main(["archive", job_id]) == 1
+        assert "not archiving" in capsys.readouterr().out
+    finally:
+        cli.main(["cancel", job_id])
+        wait_terminal(job_id)
+
+
+def test_archive_hides_generationless_synthesized_death(capsys):
+    job_id = spawn(capsys, "-n", "legacy-death")
+    wait_terminal(job_id)
+    jd = jobs.job_dir(job_id)
+    state = jobs.read_json(jd / "state.json")
+    state.update(phase="running", runner_pid=999_999_999)
+    state.pop("generation", None)
+    state.pop("finished_at", None)
+    state.pop("attention_tracked", None)
+    jobs.write_json(jd / "state.json", state)
+    assert jobs.load_state(job_id)["phase"] == "died"
+
+    assert cli.main(["archive", job_id]) == 0
+    capsys.readouterr()
+    cli.main(["status"])
+    assert job_id not in capsys.readouterr().out
+    assert jobs.attention_record(job_id)["archived_legacy"] is True
+
+    assert cli.main(["send", job_id, "resume legacy"]) == 0
+    capsys.readouterr()
+    wait_terminal(job_id)
+    cli.main(["status", "--attention"])
+    out = capsys.readouterr().out
+    assert job_id in out and "[review]" in out
+
+
+def test_legacy_archive_timestamp_cannot_hide_resumed_generation(capsys):
+    job_id = spawn(capsys, "-n", "archive-clock-skew")
+    wait_terminal(job_id)
+    jd = jobs.job_dir(job_id)
+    state = jobs.read_json(jd / "state.json")
+    state.pop("generation", None)
+    state["finished_at"] = 10_000
+    jobs.write_json(jd / "state.json", state)
+    assert cli.main(["archive", job_id]) == 0
+    capsys.readouterr()
+
+    state.update(
+        phase="done",
+        generation=1,
+        attention_tracked=True,
+        turn_id="resumed-behind-clock",
+        started_at=100,
+        finished_at=200,
+    )
+    jobs.write_json(jd / "state.json", state)
+    cli.main(["status", "--attention"])
+    out = capsys.readouterr().out
+    assert job_id in out and "[review]" in out
+
+
+def test_bounded_event_log_rotates_and_compacts_terminal_tail(tmp_path):
+    event_log = BoundedEventLog(tmp_path, max_bytes=1200, terminal_bytes=350)
+    for index in range(40):
+        event_log.write({"method": "test/event", "params": {"index": index, "text": "x" * 80}})
+    event_log.file.flush()
+    paths = [event_log.rotated, event_log.path]
+    assert event_log.rotated.exists()
+    assert sum(path.stat().st_size for path in paths if path.exists()) <= 1200
+
+    event_log.close(terminal=True)
+    assert sum(path.stat().st_size for path in paths if path.exists()) <= 350
+    lines = []
+    for path in paths:
+        if path.exists():
+            lines.extend(path.read_text().splitlines())
+    payloads = [json.loads(line) for line in lines]
+    assert payloads[-1]["params"]["index"] == 39
+
+
+def test_bounded_event_log_replaces_oversized_notification(tmp_path):
+    event_log = BoundedEventLog(tmp_path, max_bytes=1000, terminal_bytes=500)
+    event_log.write({"method": "huge/event", "params": {"text": "x" * 5000}})
+    event_log.close()
+    payload = json.loads(event_log.path.read_text())
+    assert payload["method"] == "codexspin/event-truncated"
+    assert payload["params"]["originalMethod"] == "huge/event"
+    assert event_log.path.stat().st_size <= 500
+
+
+def test_terminal_compaction_keeps_marker_for_event_larger_than_tail(tmp_path):
+    event_log = BoundedEventLog(tmp_path, max_bytes=2000, terminal_bytes=300)
+    event_log.write({"method": "medium/event", "params": {"text": "x" * 700}})
+    event_log.close(terminal=True)
+    assert event_log.path.stat().st_size <= 300
+    payload = json.loads(event_log.path.read_text())
+    assert payload["method"] == "codexspin/event-truncated"
+    assert payload["params"]["originalMethod"] == "medium/event"
+
+
+def test_legacy_oversized_final_event_compacts_to_valid_marker(tmp_path):
+    (tmp_path / "events.jsonl").write_text(
+        json.dumps({"method": "legacy/huge", "params": {"text": "x" * 2000}}) + "\n"
+    )
+    event_log = BoundedEventLog(tmp_path, max_bytes=2000, terminal_bytes=300)
+    event_log.close(terminal=True)
+    payload = json.loads((tmp_path / "events.jsonl").read_text())
+    assert payload["method"] == "codexspin/event-truncated"
+    assert (tmp_path / "events.jsonl").stat().st_size <= 300
+
+
+def test_tail_compaction_preserves_record_at_exact_boundary(tmp_path):
+    latest = json.dumps({"method": "latest", "params": {"text": "x" * 400}}) + "\n"
+    prior = json.dumps({"method": "prior", "params": {"text": "y" * 100}}) + "\n"
+    (tmp_path / "events.jsonl").write_text(prior + latest)
+    event_log = BoundedEventLog(
+        tmp_path, max_bytes=len(latest.encode()) * 2, terminal_bytes=len(latest.encode()),
+    )
+    event_log.close(terminal=True)
+    payload = json.loads((tmp_path / "events.jsonl").read_text())
+    assert payload["method"] == "latest"
+
+
+def test_bounded_event_log_serializes_compactors(tmp_path):
+    first = BoundedEventLog(tmp_path, max_bytes=1000, terminal_bytes=500)
+    acquired = threading.Event()
+
+    def open_second():
+        second = BoundedEventLog(tmp_path, max_bytes=1000, terminal_bytes=500)
+        acquired.set()
+        second.close(terminal=True)
+
+    thread = threading.Thread(target=open_second)
+    thread.start()
+    assert not acquired.wait(0.1)
+    first.close(terminal=True)
+    assert acquired.wait(2)
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_turn_completion_is_published_after_event_write(tmp_path):
+    jobs.write_json(tmp_path / "job.json", {"cwd": str(tmp_path)})
+    jobs.write_json(tmp_path / "state.json", {"job_id": "test", "generation": 1})
+    runner = Runner(tmp_path, resume=False)
+    runner.events.close()
+    writing = threading.Event()
+    release = threading.Event()
+
+    class BlockingEvents:
+        def write(self, _msg):
+            writing.set()
+            release.wait(2)
+
+    runner.events = BlockingEvents()
+    notification = {
+        "method": "turn/completed",
+        "params": {"turn": {"id": "turn", "status": "completed"}},
+    }
+    thread = threading.Thread(target=runner.on_notification, args=(notification,))
+    thread.start()
+    assert writing.wait(1)
+    assert not runner.turn_done.is_set()
+    release.set()
+    thread.join(timeout=2)
+    assert runner.turn_done.is_set()
+    runner.log.close()
+
+
+def test_late_notification_cannot_revert_terminal_state(tmp_path):
+    jobs.write_json(tmp_path / "job.json", {"cwd": str(tmp_path)})
+    jobs.write_json(tmp_path / "state.json", {
+        "job_id": "test", "generation": 1, "phase": "starting",
+        "started_at": time.time(),
+    })
+    runner = Runner(tmp_path, resume=False)
+    runner.finish("failed", error={"message": "startup failed"})
+    runner.on_notification({
+        "method": "turn/started",
+        "params": {"turn": {"id": "late-turn"}},
+    })
+    assert jobs.read_json(tmp_path / "state.json")["phase"] == "failed"
+    runner.events.close(terminal=True)
+    runner.log.close()
+
+
+def test_logs_reads_rotated_segment_before_current(capsys):
+    job_id = spawn(capsys, "-n", "rotated-logs")
+    wait_terminal(job_id)
+    jd = jobs.job_dir(job_id)
+    (jd / "events.jsonl.1").write_text(json.dumps({"method": "turn/started", "params": {}}) + "\n")
+    (jd / "events.jsonl").write_text(json.dumps({
+        "method": "turn/completed", "params": {"turn": {"status": "completed"}},
+    }) + "\n")
+    assert cli.main(["logs", job_id, "--json", "-n", "2"]) == 0
+    methods = [json.loads(line)["method"] for line in capsys.readouterr().out.splitlines()]
+    assert methods == ["turn/started", "turn/completed"]
 
 
 SESSION_A = "aaaa1111-2222-3333-4444-555566667777"
@@ -423,8 +1022,33 @@ def test_session_start_hook_truncation_keeps_other_sessions_summary(capsys, monk
     )
     assert proc.returncode == 0
     lines = proc.stdout.strip().splitlines()
+    assert lines[0].startswith("codexspin attention (this session + unowned)")
     assert any("… truncated" in line for line in lines)
     assert lines[-1] == "+ 1 job from 1 other Claude session — codexspin status --all-sessions"
+
+
+def test_session_start_hook_uses_compact_working_count(monkeypatch, capsys):
+    codexspin_bin = Path(sys.executable).parent / "codexspin"
+    if not codexspin_bin.exists():
+        pytest.skip("codexspin console script not installed next to the interpreter")
+    monkeypatch.setenv("FAKE_MODE", "slow")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION_A)
+    job_id = spawn(capsys, "-n", "background")
+    try:
+        wait_running_with_events(job_id)
+        hook = Path(__file__).parent.parent / "hooks" / "session-start.sh"
+        env = {**os.environ, "PATH": f"{codexspin_bin.parent}{os.pathsep}{os.environ['PATH']}"}
+        proc = subprocess.run(
+            ["bash", str(hook)], input=json.dumps({"session_id": SESSION_A}),
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert proc.returncode == 0
+        assert "codexspin attention (this session + unowned)" in proc.stdout
+        assert "+ 1 working job — codexspin status" in proc.stdout
+        assert job_id not in proc.stdout
+    finally:
+        cli.main(["cancel", job_id])
+        wait_terminal(job_id)
 
 
 def test_explicit_job_id_crosses_sessions(capsys, monkeypatch):
@@ -591,6 +1215,8 @@ def test_status_await_and_yolo_spec(capsys):
     assert rc == 0
     assert f"--- {job_a}: done ---" in out
     assert f"--- {job_b}: done ---" in out
+    assert jobs.viewed_at(job_a) is not None
+    assert jobs.viewed_at(job_b) is not None
 
     cli.main(["status", "--all"])
     out = capsys.readouterr().out
@@ -603,6 +1229,33 @@ def test_job_id_prefix_resolution(capsys):
     assert jobs.resolve_job_id("uniqueprefix") == job_id
     with pytest.raises(SystemExit, match="no job matches"):
         jobs.resolve_job_id("nonexistent")
+
+
+def test_job_id_rejects_paths_and_symlinked_directories(tmp_path):
+    outside = tmp_path / "outside-job"
+    outside.mkdir()
+    jobs.jobs_root().mkdir(parents=True)
+    (jobs.jobs_root() / "linked-job").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(SystemExit, match="invalid job id"):
+        jobs.resolve_job_id(str(outside))
+    with pytest.raises(SystemExit, match="invalid job id"):
+        jobs.resolve_job_id("../outside-job")
+    with pytest.raises(SystemExit, match="no job matches"):
+        jobs.resolve_job_id("linked-job")
+
+
+@pytest.mark.parametrize("lock_name", ["cli.lock", "attention.lock"])
+def test_result_lock_files_do_not_follow_symlinks(capsys, tmp_path, lock_name):
+    job_id = spawn(capsys, "-n", "safe-lock")
+    wait_terminal(job_id)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me\n")
+    (jobs.job_dir(job_id) / lock_name).symlink_to(victim)
+
+    with pytest.raises(OSError):
+        cli.main(["result", job_id])
+    assert victim.read_text() == "keep me\n"
 
 
 def test_appserver_death_midturn_fails_job(capsys, monkeypatch):
@@ -682,7 +1335,12 @@ def test_worktree_spawn_and_gc(capsys, tmp_path):
     spec = json.loads((jobs.job_dir(job_id) / "job.json").read_text())
     assert spec["branch"] == f"codexspin/{job_id}"
     assert spec["cwd"] == spec["worktree"] != str(repo)
+    assert Path(spec["worktree"]).parent == repo / ".worktrees"
     assert Path(spec["worktree"]).is_dir()
+    assert "/.worktrees/" in (repo / ".git" / "info" / "exclude").read_text().splitlines()
+    assert not subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout
     wait_terminal(job_id)
 
     cli.main(["status", job_id])
@@ -702,6 +1360,39 @@ def test_worktree_spawn_and_gc(capsys, tmp_path):
     assert not jobs.job_dir(job_id).is_dir()
     branches = subprocess.run(["git", "branch"], cwd=repo, capture_output=True, text=True).stdout
     assert f"codexspin/{job_id}" in branches  # committed work survives on the branch
+
+
+def test_worktree_allows_symlinked_git_exclude(capsys, tmp_path):
+    repo = make_repo(tmp_path / "repo")
+    exclude = repo / ".git" / "info" / "exclude"
+    shared = tmp_path / "shared-exclude"
+    shared.write_text("# shared\n")
+    exclude.unlink()
+    exclude.symlink_to(shared)
+
+    assert cli.main(["spawn", "-w", "-C", str(repo), "-n", "symlink-exclude", "work"]) == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    assert "/.worktrees/" in shared.read_text().splitlines()
+    wait_terminal(job_id)
+
+
+def test_worktree_handles_non_ascii_repo_path(capsys, tmp_path):
+    repo = make_repo(tmp_path / "répo")
+    assert cli.main(["spawn", "-w", "-C", str(repo), "-n", "unicode", "work"]) == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    spec = jobs.read_json(jobs.job_dir(job_id) / "job.json")
+    assert Path(spec["worktree"]).parent == repo / ".worktrees"
+    wait_terminal(job_id)
+
+
+def test_worktree_rejects_symlinked_repo_local_root(tmp_path):
+    repo = make_repo(tmp_path / "repo")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / ".worktrees").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(SystemExit, match="unsafe worktree root"):
+        cli.main(["spawn", "-w", "-C", str(repo), "work"])
+    assert not list(outside.iterdir())
 
 
 def test_worktree_job_gets_git_writable_root(capsys, tmp_path, monkeypatch):
@@ -741,6 +1432,42 @@ def test_external_worktree_job_gets_git_writable_root(capsys, tmp_path, monkeypa
     argv = json.loads(argv_file.read_text())
     assert argv[0] == "-c"
     assert json.loads(argv[1].split("=", 1)[1]) == [common]
+
+
+def test_worktree_spawn_from_linked_worktree_uses_primary_repo_root(capsys, tmp_path):
+    repo = make_repo(tmp_path / "repo")
+    parent_wt = tmp_path / "parent-wt"
+    subprocess.run([
+        "git", "-C", str(repo), "worktree", "add", "-b", "parent",
+        str(parent_wt), "HEAD",
+    ], check=True, capture_output=True)
+
+    assert cli.main(["spawn", "-w", "-C", str(parent_wt), "-n", "child", "work"]) == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    spec = jobs.read_json(jobs.job_dir(job_id) / "job.json")
+    assert Path(spec["worktree"]).parent == repo / ".worktrees"
+    assert not Path(spec["worktree"]).is_relative_to(parent_wt)
+    wait_terminal(job_id)
+
+
+def test_worktree_spawn_with_bare_common_repo_uses_external_fallback(capsys, tmp_path):
+    source = make_repo(tmp_path / "source")
+    bare = tmp_path / "repo.git"
+    subprocess.run(["git", "clone", "--bare", str(source), str(bare)],
+                   check=True, capture_output=True)
+    linked = tmp_path / "linked"
+    subprocess.run([
+        "git", "-C", str(bare), "worktree", "add", "-b", "linked",
+        str(linked), "HEAD",
+    ], check=True, capture_output=True)
+
+    assert cli.main(["spawn", "-w", "-C", str(linked), "-n", "bare-child", "work"]) == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    spec = jobs.read_json(jobs.job_dir(job_id) / "job.json")
+    assert Path(spec["worktree"]).parent == tmp_path / ".worktrees"
+    assert not Path(spec["worktree"]).is_relative_to(bare)
+    assert not Path(spec["worktree"]).is_relative_to(linked)
+    wait_terminal(job_id)
 
 
 def test_plain_repo_job_gets_no_git_writable_root(capsys, tmp_path):
@@ -1120,6 +1847,7 @@ def test_run_foreground_spawn_wait_result(capsys):
     assert job_line, out
     job_id = job_line[0][2:].split(" — ")[0]
     assert jobs.load_state(job_id)["phase"] == "done"
+    assert jobs.viewed_at(job_id) is not None
 
 
 def test_run_failed_job_exit_code(capsys, monkeypatch):
@@ -1206,3 +1934,5 @@ def test_send_wait_blocks_and_prints(capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "FAKE-DONE" in out              # printed the result inline, no separate await
+    assert jobs.viewed_at(job_id) is not None
+    assert jobs.load_state(job_id)["generation"] == 2

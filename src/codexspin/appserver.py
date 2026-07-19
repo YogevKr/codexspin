@@ -110,6 +110,13 @@ class AppServerClient:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+                self.proc.wait(timeout=5)
+        # Process exit closes both pipes. Drain their reader threads before a
+        # caller tears down notification-owned resources such as event logs.
+        current = threading.current_thread()
+        for reader in (self._stdout_thread, self._stderr_thread):
+            if reader is not current:
+                reader.join(timeout=5)
 
     def _send(self, message: dict) -> None:
         if self.closed or not self.proc.stdin:

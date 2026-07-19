@@ -16,9 +16,116 @@ import time
 from pathlib import Path
 
 from .appserver import AppServerClient, AppServerError
-from .jobs import read_json, write_json
+from .jobs import exclusive_lock, read_json, write_json
 
 STARTUP_TIMEOUT = float(os.environ.get("CODEXSPIN_STARTUP_TIMEOUT", "180"))
+EVENTS_MAX_BYTES = int(os.environ.get("CODEXSPIN_EVENTS_MAX_BYTES", "10000000"))
+EVENTS_TERMINAL_BYTES = int(os.environ.get("CODEXSPIN_EVENTS_TERMINAL_BYTES", "1000000"))
+
+
+class BoundedEventLog:
+    """Two-segment active log, compacted to a small tail on completion."""
+
+    def __init__(self, job_path: Path, max_bytes: int = EVENTS_MAX_BYTES,
+                 terminal_bytes: int = EVENTS_TERMINAL_BYTES):
+        self._mutex = threading.Lock()
+        self._closed = False
+        self._lock_context = exclusive_lock(job_path / "events.lock")
+        self._process_lock = self._lock_context.__enter__()
+        try:
+            self.path = job_path / "events.jsonl"
+            self.rotated = self.path.with_name(self.path.name + ".1")
+            self.max_bytes = max(512, max_bytes)
+            self.segment_bytes = max(1, self.max_bytes // 2)
+            self.terminal_bytes = max(256, min(terminal_bytes, self.max_bytes))
+            # Normalize legacy/unbounded logs before appending. Starting with
+            # one segment leaves room for the next without exceeding the cap.
+            self._compact(self.segment_bytes)
+            self.file = open(self.path, "a", buffering=1)
+        except Exception:
+            self._lock_context.__exit__(*sys.exc_info())
+            raise
+
+    @staticmethod
+    def _tail(paths: list[Path], limit: int) -> bytes:
+        sizes = [path.stat().st_size if path.exists() else 0 for path in paths]
+        total = sum(sizes)
+        remaining = limit if total <= limit else limit + 1
+        chunks = []
+        for path, size in reversed(list(zip(paths, sizes))):
+            if not size or not remaining:
+                continue
+            take = min(size, remaining)
+            with open(path, "rb") as fh:
+                fh.seek(size - take)
+                chunks.append(fh.read(take))
+            remaining -= take
+        data = b"".join(reversed(chunks))
+        if total <= limit:
+            return data
+        # Read one byte before the retained window. A newline proves the
+        # window begins at a JSONL boundary; otherwise discard the partial
+        # first record. Legacy logs may contain one final record larger than
+        # the entire window, in which case retain a valid diagnostic marker.
+        preceding, retained = data[:1], data[1:]
+        if preceding == b"\n":
+            return retained
+        newline = retained.find(b"\n")
+        if 0 <= newline < len(retained) - 1:
+            return retained[newline + 1:]
+        return (json.dumps({
+            "method": "codexspin/event-truncated",
+            "params": {"reason": "legacy event exceeds retained tail"},
+        }) + "\n").encode()
+
+    def _compact(self, limit: int) -> None:
+        paths = [self.rotated, self.path]
+        if sum(path.stat().st_size for path in paths if path.exists()) <= limit:
+            return
+        data = self._tail(paths, limit)
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        tmp.write_bytes(data)
+        tmp.replace(self.path)
+        self.rotated.unlink(missing_ok=True)
+
+    def _rotate(self) -> None:
+        self.file.close()
+        if self.path.exists():
+            self.path.replace(self.rotated)
+        self.file = open(self.path, "w", buffering=1)
+
+    def write(self, msg: dict) -> None:
+        with self._mutex:
+            if self._closed:
+                raise OSError("event log is closed")
+            line = json.dumps(msg) + "\n"
+            encoded_bytes = len(line.encode())
+            record_limit = min(self.segment_bytes, self.terminal_bytes)
+            if encoded_bytes > record_limit:
+                line = json.dumps({
+                    "method": "codexspin/event-truncated",
+                    "params": {
+                        "originalMethod": msg.get("method"),
+                        "originalBytes": encoded_bytes,
+                    },
+                }) + "\n"
+                encoded_bytes = len(line.encode())
+            if self.file.tell() and self.file.tell() + encoded_bytes > self.segment_bytes:
+                self._rotate()
+            self.file.write(line)
+
+    def close(self, terminal: bool = False) -> None:
+        with self._mutex:
+            if self._closed:
+                return
+            try:
+                if not self.file.closed:
+                    self.file.close()
+                if terminal:
+                    self._compact(self.terminal_bytes)
+            finally:
+                self._closed = True
+                self._lock_context.__exit__(None, None, None)
 
 
 class Runner:
@@ -27,7 +134,7 @@ class Runner:
         self.resume = resume
         self.spec = read_json(job_path / "job.json") or {}
         self.state = read_json(job_path / "state.json") or {}
-        self.events = open(job_path / "events.jsonl", "a", buffering=1)
+        self.events = BoundedEventLog(job_path)
         self.log = open(job_path / "runner.log", "a", buffering=1)
         self.client: AppServerClient | None = None
         self.thread_id: str | None = self.state.get("thread_id") if resume else None
@@ -42,6 +149,7 @@ class Runner:
         self.cancelled = False
         self.timed_out = False
         self._state_lock = threading.Lock()
+        self._finished = False
 
     def logline(self, msg: str) -> None:
         self.log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
@@ -51,6 +159,8 @@ class Runner:
         # thread all write state; serialize so a snapshot is never taken
         # mid-mutation.
         with self._state_lock:
+            if self._finished:
+                return
             self.state.update(updates, updated_at=time.time(), event_count=self.event_count)
             write_json(self.dir / "state.json", dict(self.state))
 
@@ -71,11 +181,10 @@ class Runner:
         params = msg.get("params", {})
         if method == "turn/completed" and self.is_own_thread(params):
             self.final_turn = params.get("turn") or {}
-            self.turn_done.set()
 
         self.event_count += 1
         try:
-            self.events.write(json.dumps(msg) + "\n")
+            self.events.write(msg)
         except OSError as exc:
             try:
                 self.logline(f"failed to write notification event: {exc}")
@@ -138,6 +247,10 @@ class Runner:
                 self.logline(f"failed to update state for {method}: {exc}")
             except OSError:
                 pass
+        if method == "turn/completed" and self.is_own_thread(params):
+            # Publish completion only after the final notification is logged
+            # and reflected in state. Runner shutdown can now drain safely.
+            self.turn_done.set()
 
     @staticmethod
     def describe_item(item: dict) -> str | None:
@@ -305,19 +418,41 @@ class Runner:
             "touched_files": self.touched_files,
             "command_count": self.command_count,
             "duration_ms": self.final_turn.get("durationMs"),
+            "generation": self.state.get("generation"),
+            "started_at": self.state.get("started_at"),
             "finished_at": time.time(),
         }
         write_json(self.dir / "result.json", result)
         with open(self.dir / "results.jsonl", "a") as fh:
             fh.write(json.dumps(result) + "\n")
-        self.set_state(phase=phase, activity="finished", finished_at=result["finished_at"])
+        # Terminal publication is a barrier: reader-thread notifications that
+        # drain during client shutdown may still be logged, but can no longer
+        # revert the execution phase to running.
+        with self._state_lock:
+            self._finished = True
+            self.state.update(
+                phase=phase,
+                activity="finished",
+                finished_at=result["finished_at"],
+                updated_at=time.time(),
+                event_count=self.event_count,
+            )
+            write_json(self.dir / "state.json", dict(self.state))
         self.logline(f"finished: {phase}")
 
 
 def main() -> int:
     job_path = Path(sys.argv[1])
     resume = "--resume" in sys.argv[2:]
-    return Runner(job_path, resume).run()
+    runner = Runner(job_path, resume)
+    try:
+        return runner.run()
+    finally:
+        state = read_json(job_path / "state.json") or {}
+        runner.events.close(terminal=state.get("phase") in {
+            "done", "failed", "cancelled", "died", "timeout",
+        })
+        runner.log.close()
 
 
 if __name__ == "__main__":
