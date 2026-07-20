@@ -1,7 +1,7 @@
 {
   "name": "codexspin",
   "description": "Spin and manage parallel Codex sessions, transfer the current Claude Code session into a resumable Codex thread with visible history, and surface background jobs at session start.",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "author": {
     "name": "Yogev Kriger",
     "url": "https://github.com/YogevKr"

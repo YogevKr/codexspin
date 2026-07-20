@@ -115,6 +115,10 @@ background a raw `codex exec` with nohup/watchdogs — that pattern is retired.
      review you owe afterwards is the control.
    Use `-o <file>` to capture the final message and background long calls.
    Non-interactive runs never ask for approval either way.
+   **The sandbox binds Codex's own machinery, not just your task.** Under
+   `workspace-write` its end-of-turn self-review has no network and won't run —
+   a job that finished is not a job that was reviewed. The review above is
+   yours to run.
 4. Follow up with `codex exec resume <session-id> "<follow-up>"`, taking the
    id from the run header. `resume --last` means the most recent session
    globally — a review or any other codex run in between will hijack it.
