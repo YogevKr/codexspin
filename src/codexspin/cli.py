@@ -180,6 +180,30 @@ def _codex_minor(version_output: str) -> str | None:
     return f"{m.group(1)}.{m.group(2)}" if m else None
 
 
+def _herdr_setup(cwd: str, label: str) -> dict:
+    """Create a herdr workspace pane on `cwd` so the job's runner can report a
+    NATIVE codex agent into herdr's panel (see runner._herdr_maybe_report). The
+    pane is a plain shell in the job's worktree — click the agent to land there.
+    Best-effort: returns {} (job proceeds normally, un-mirrored) if herdr is
+    absent or errors. Returns {herdr_pane_id, herdr_bin} to fold into job.json."""
+    import shutil
+    herdr = shutil.which("herdr")
+    if not herdr:
+        return {}
+    try:
+        out = subprocess.run(
+            [herdr, "workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode != 0:
+            return {}
+        pane = ((json.loads(out.stdout or "{}").get("result") or {})
+                .get("root_pane") or {}).get("pane_id")
+        return {"herdr_pane_id": pane, "herdr_bin": herdr} if pane else {}
+    except Exception:
+        return {}
+
+
 def launch_runner(jd: Path, resume: bool = False) -> int:
     """Double-fork so the runner is orphaned to init: it never becomes a
     zombie child of the spawning process, keeping pid liveness checks honest."""
@@ -347,6 +371,9 @@ def _create_job(args) -> str:
         common = wt.get("git_common_dir") or git_common_dir(cwd)
         if common and os.path.isdir(common) and not _is_within(common, cwd):
             writable_roots.append(common)
+    herdr_on = getattr(args, "herdr", False) or \
+        os.environ.get("CODEXSPIN_HERDR") in ("1", "true", "yes")
+    herdr_info = _herdr_setup(cwd, f"cs:{args.name or job_id}") if herdr_on else {}
     write_json(jd / "job.json", {
         "job_id": job_id,
         "prompt": prompt,
@@ -359,6 +386,7 @@ def _create_job(args) -> str:
         "created_at": time.time(),
         **({"session_id": session_id} if session_id else {}),
         **wt,
+        **herdr_info,
     })
     write_json(jd / "state.json", {
         "job_id": job_id,
@@ -1369,6 +1397,9 @@ def main(argv: list[str] | None = None) -> int:
                        help="interrupt the job after this many minutes (phase: timeout)")
         p.add_argument("--writable-root", action="append", metavar="DIR",
                        help="extra writable dir for the workspace-write sandbox (repeatable)")
+        p.add_argument("--herdr", action="store_true",
+                       help="show this job as a native codex agent in herdr's agent panel "
+                            "(also enabled by CODEXSPIN_HERDR=1)")
         _add_host_argument(p)
 
     p = sub.add_parser("spawn", help="spawn a detached codex job")

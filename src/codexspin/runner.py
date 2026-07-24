@@ -10,13 +10,14 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
 from .appserver import AppServerClient, AppServerError
-from .jobs import exclusive_lock, read_json, write_json
+from .jobs import TERMINAL_PHASES, exclusive_lock, read_json, write_json
 
 STARTUP_TIMEOUT = float(os.environ.get("CODEXSPIN_STARTUP_TIMEOUT", "180"))
 EVENTS_MAX_BYTES = int(os.environ.get("CODEXSPIN_EVENTS_MAX_BYTES", "10000000"))
@@ -150,9 +151,37 @@ class Runner:
         self.timed_out = False
         self._state_lock = threading.Lock()
         self._finished = False
+        self._herdr_last_key: tuple | None = None
 
     def logline(self, msg: str) -> None:
         self.log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
+
+    def _herdr_maybe_report(self) -> None:
+        """When the job was spawned with herdr mirroring (job.json carries
+        herdr_pane_id + herdr_bin), surface it in herdr's agent panel as a NATIVE
+        codex agent — same report-agent API the built-in codex integration uses,
+        but driven from this job's real turn events and linked to its real codex
+        thread. Best-effort and non-blocking: a herdr hiccup must never touch the
+        job. Only fires on a state transition (working<->idle) or once the real
+        thread id is known, so it stays ~3 calls per job, not per event."""
+        pane = self.spec.get("herdr_pane_id")
+        herdr = self.spec.get("herdr_bin")
+        if not pane or not herdr:
+            return
+        desired = "idle" if self.state.get("phase") in TERMINAL_PHASES else "working"
+        key = (desired, bool(self.thread_id))
+        if key == self._herdr_last_key:
+            return
+        self._herdr_last_key = key
+        args = [herdr, "pane", "report-agent", pane,
+                "--source", "herdr:codexspin", "--agent", "codex",
+                "--state", desired, "--seq", str(time.time_ns())]
+        if self.thread_id:
+            args += ["--agent-session-id", self.thread_id]
+        try:
+            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
 
     def set_state(self, **updates) -> None:
         # The deadline timer, the stdout notification thread, and the main
@@ -163,6 +192,7 @@ class Runner:
                 return
             self.state.update(updates, updated_at=time.time(), event_count=self.event_count)
             write_json(self.dir / "state.json", dict(self.state))
+            self._herdr_maybe_report()
 
     def is_own_thread(self, params: dict) -> bool:
         """Whether a notification speaks for this job.
@@ -438,6 +468,7 @@ class Runner:
                 event_count=self.event_count,
             )
             write_json(self.dir / "state.json", dict(self.state))
+            self._herdr_maybe_report()
         self.logline(f"finished: {phase}")
 
 
