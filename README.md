@@ -93,7 +93,10 @@ Job ids accept unambiguous prefixes. Every job records the codex thread id, so
   agent panel as a native `codex` agent: it opens a herdr workspace on the job's
   cwd and the runner reports live state (`working` -> `done`) linked to the real
   codex thread, so herdr shows it — and fires herdr's desktop notification — with
-  no polling. Best-effort: if herdr isn't installed the job runs unchanged.
+  no polling. The herdr workspace auto-closes a few seconds after the job
+  finishes so the panel does not accumulate (tune/disable with
+  `CODEXSPIN_HERDR_CLOSE_DELAY`, seconds; negative keeps it open) — the worktree
+  itself is untouched. Best-effort: if herdr isn't installed the job runs unchanged.
 - `--max-minutes N` interrupts a runaway job (phase `timeout`).
 - `status` shows each job's resolved model/effort and the latest ChatGPT
   quota reading (`account/rateLimits/updated` pushed by the app-server).

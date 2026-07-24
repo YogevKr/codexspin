@@ -183,6 +183,30 @@ class Runner:
         except Exception:
             pass
 
+    def _herdr_close(self) -> None:
+        """Close the job's herdr workspace once the runner is done, so finished
+        jobs don't pile up in the agent panel. A short grace (CODEXSPIN_HERDR_
+        CLOSE_DELAY seconds, default 3) lets the final done state + notification
+        propagate first; set it negative to keep the pane open. The worktree is
+        untouched — reopen it any time with `csws`. Best-effort."""
+        pane = self.spec.get("herdr_pane_id")
+        herdr = self.spec.get("herdr_bin")
+        if not pane or not herdr:
+            return
+        try:
+            delay = float(os.environ.get("CODEXSPIN_HERDR_CLOSE_DELAY", "3"))
+        except ValueError:
+            delay = 3.0
+        if delay < 0:
+            return
+        if delay:
+            time.sleep(delay)
+        try:
+            subprocess.run([herdr, "workspace", "close", pane.split(":", 1)[0]],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except Exception:
+            pass
+
     def set_state(self, **updates) -> None:
         # The deadline timer, the stdout notification thread, and the main
         # thread all write state; serialize so a snapshot is never taken
@@ -484,6 +508,7 @@ def main() -> int:
             "done", "failed", "cancelled", "died", "timeout",
         })
         runner.log.close()
+        runner._herdr_close()
 
 
 if __name__ == "__main__":
