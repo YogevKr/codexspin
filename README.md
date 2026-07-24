@@ -90,8 +90,10 @@ Job ids accept unambiguous prefixes. Every job records the codex thread id, so
   worktrees — committed work survives on the branch, uncommitted work keeps
   the job. `--writable-root DIR` (repeatable) adds further writable dirs.
 - `--herdr` (or `CODEXSPIN_HERDR=1`) surfaces the job in [herdr](https://herdr.dev)'s
-  agent panel as a native `codex` agent: it opens a herdr workspace on the job's
-  cwd and the runner reports live state (`working` -> `done`) linked to the real
+  agent panel as a native `codex` agent: it opens a herdr pane on the job's git
+  worktree — nested under the source repo's space (via herdr's worktree API), not
+  a flat top-level workspace — and the runner reports live state (`working` ->
+  `done`) linked to the real
   codex thread, so herdr shows it — and fires herdr's desktop notification — with
   no polling. The herdr workspace auto-closes a few seconds after the job
   finishes so the panel does not accumulate (tune/disable with

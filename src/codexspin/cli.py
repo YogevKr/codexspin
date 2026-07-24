@@ -180,21 +180,27 @@ def _codex_minor(version_output: str) -> str | None:
     return f"{m.group(1)}.{m.group(2)}" if m else None
 
 
-def _herdr_setup(cwd: str, label: str) -> dict:
-    """Create a herdr workspace pane on `cwd` so the job's runner can report a
-    NATIVE codex agent into herdr's panel (see runner._herdr_maybe_report). The
-    pane is a plain shell in the job's worktree — click the agent to land there.
-    Best-effort: returns {} (job proceeds normally, un-mirrored) if herdr is
-    absent or errors. Returns {herdr_pane_id, herdr_bin} to fold into job.json."""
+def _herdr_setup(cwd: str, label: str, repo_root: str | None = None,
+                 worktree: str | None = None) -> dict:
+    """Create a herdr pane for the job so its runner can report a NATIVE codex
+    agent into herdr's panel (see runner._herdr_maybe_report). When the job runs
+    in a git worktree, register it via herdr's worktree API (`worktree open`) so
+    herdr NESTS it under the source repo's space in the sidebar rather than
+    spawning a flat top-level workspace per job; otherwise fall back to a plain
+    workspace. The pane is a shell in the job's worktree — click the agent to
+    land there. Best-effort: returns {} (job proceeds un-mirrored) on any
+    failure. Returns {herdr_pane_id, herdr_bin} to fold into job.json."""
     import shutil
     herdr = shutil.which("herdr")
     if not herdr:
         return {}
+    if repo_root and worktree:
+        cmd = [herdr, "worktree", "open", "--cwd", repo_root, "--path", worktree,
+               "--label", label, "--no-focus", "--json"]
+    else:
+        cmd = [herdr, "workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"]
     try:
-        out = subprocess.run(
-            [herdr, "workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"],
-            capture_output=True, text=True, timeout=10,
-        )
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if out.returncode != 0:
             return {}
         pane = ((json.loads(out.stdout or "{}").get("result") or {})
@@ -373,7 +379,9 @@ def _create_job(args) -> str:
             writable_roots.append(common)
     herdr_on = getattr(args, "herdr", False) or \
         os.environ.get("CODEXSPIN_HERDR") in ("1", "true", "yes")
-    herdr_info = _herdr_setup(cwd, f"cs:{args.name or job_id}") if herdr_on else {}
+    herdr_info = _herdr_setup(cwd, f"cs:{args.name or job_id}",
+                              repo_root=wt.get("repo_root"), worktree=wt.get("worktree")) \
+        if herdr_on else {}
     write_json(jd / "job.json", {
         "job_id": job_id,
         "prompt": prompt,
