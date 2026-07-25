@@ -165,8 +165,9 @@ Verified against codex-cli 0.144 (July 2026).
    `--yolo` for jobs that must bind localhost / run dev servers / fetch
    network — same controls as the exec bypass below: worktree (`-w` covers
    it), self-authored prompt, diff review after. `-m/--model -e/--effort`
-   override config defaults; `status` shows the resolved model and current
-   ChatGPT quota burn — check it before spawning a large fleet.
+   override config defaults; `status` shows the resolved model, and
+   `status --usage` the current ChatGPT usage burn — check it before
+   spawning a large fleet.
 2. `codexspin await <job> [<job>...]` as a background Bash task — a
    busy-waiting shell that blocks until done and prints each result (final
    message, touched files); the task notification wakes you when it exits.

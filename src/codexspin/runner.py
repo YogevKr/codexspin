@@ -290,7 +290,7 @@ class Runner:
                 limits = (params.get("rateLimits") or {})
                 primary = limits.get("primary") or {}
                 if primary.get("usedPercent") is not None:
-                    self.set_state(quota={
+                    self.set_state(usage={
                         "used_percent": primary.get("usedPercent"),
                         "window_mins": primary.get("windowDurationMins"),
                         "plan": limits.get("planType"),

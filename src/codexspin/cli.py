@@ -623,17 +623,17 @@ def styled_attention(st: Style, attention: str | None) -> str:
     return ""
 
 
-def quota_line(st: Style, quota: dict, fancy: bool) -> str:
-    mins = quota.get("window_mins") or 0
+def usage_line(st: Style, usage: dict, fancy: bool) -> str:
+    mins = usage.get("window_mins") or 0
     if mins >= 1440:
         window = f"{round(mins / 1440)}d"
     elif mins >= 60:
         window = f"{round(mins / 60)}h"
     else:
         window = f"{mins}m"
-    pct = quota.get("used_percent") or 0
-    text = (f"codex quota: {pct}% of {window} window used"
-            f" (plan: {quota.get('plan', '?')})")
+    pct = usage.get("used_percent") or 0
+    text = (f"codex usage: {pct}% of {window} window used"
+            f" (plan: {usage.get('plan', '?')})")
     if not fancy:
         return text
     filled = min(10, round(pct / 10))
@@ -789,17 +789,20 @@ def _print_status_once(args) -> int:
     if args.attention and working:
         prefix = "" if fancy else "\n"
         print(f"{prefix}{st.gray(_working_line(working))}")
-    # Quota is account-wide: hidden foreign jobs stay eligible for the freshest
+    # Usage is account-wide: hidden foreign jobs stay eligible for the freshest
     # snapshot even though their details are not rendered.
-    quota = None
-    if not args.attention:
+    usage = None
+    if args.usage:
         for s in [*states, *others]:
-            q = s.get("quota")
-            if q and (quota is None or (q.get("at") or 0) > (quota.get("at") or 0)):
-                quota = q
-        if quota:
-            prefix = "" if fancy else "\n"
-            print(f"{prefix}{quota_line(st, quota, fancy)}")
+            # "quota" is the pre-rename state key still written by in-flight jobs.
+            u = s.get("usage") or s.get("quota")
+            if u and (usage is None or (u.get("at") or 0) > (usage.get("at") or 0)):
+                usage = u
+        prefix = "" if fancy else "\n"
+        if usage:
+            print(f"{prefix}{usage_line(st, usage, fancy)}")
+        else:
+            print(f"{prefix}{st.dim('no usage snapshot yet')}")
     if others:
         prefix = "" if fancy else "\n"
         print(f"{prefix}{st.gray(_other_sessions_line(others))}")
@@ -1430,6 +1433,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="show urgent, quiet, and completed-unseen jobs plus a working count")
     p.add_argument("--watch", action="store_true",
                    help="refresh status every second until interrupted")
+    p.add_argument("--usage", action="store_true",
+                   help="show the latest ChatGPT usage snapshot")
     p.add_argument("--json", action="store_true")
     _add_host_argument(p)
     p.set_defaults(fn=cmd_status)

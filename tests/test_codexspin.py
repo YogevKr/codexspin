@@ -977,20 +977,20 @@ def test_status_with_only_foreign_jobs_prints_summary_not_no_jobs(capsys, monkey
     assert out == "+ 1 job from 1 other Claude session — codexspin status --all-sessions"
 
 
-def test_status_quota_survives_session_filtering(capsys, monkeypatch):
-    theirs = spawn_owned(capsys, monkeypatch, SESSION_B, "quota")
+def test_status_usage_survives_session_filtering(capsys, monkeypatch):
+    theirs = spawn_owned(capsys, monkeypatch, SESSION_B, "usage")
     state = jobs.read_json(jobs.job_dir(theirs) / "state.json")
     # Strictly freshest snapshot, so it must win over any the fake server pushed.
-    state["quota"] = {"used_percent": 77, "window_mins": 300, "plan": "plus", "at": time.time() + 1000}
+    state["usage"] = {"used_percent": 77, "window_mins": 300, "plan": "plus", "at": time.time() + 1000}
     jobs.write_json(jobs.job_dir(theirs) / "state.json", state)
     mine = spawn_owned(capsys, monkeypatch, SESSION_A, "mine")
 
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION_A)
-    cli.main(["status"])
+    cli.main(["status", "--usage"])
     out = capsys.readouterr().out
     assert mine in out and theirs not in out
-    # Quota is account-wide; the freshest snapshot counts even off a hidden job.
-    assert "codex quota: 77% of 5h window used (plan: plus)" in out
+    # Usage is account-wide; the freshest snapshot counts even off a hidden job.
+    assert "codex usage: 77% of 5h window used (plan: plus)" in out
 
 
 def test_remote_command_forwards_session_id(capfd, monkeypatch, tmp_path):
@@ -1507,13 +1507,17 @@ def test_max_minutes_timeout(capsys, monkeypatch):
     assert "max runtime" in result["error"]["message"]
 
 
-def test_status_shows_model_and_quota(capsys):
+def test_status_shows_model_and_usage(capsys):
     job_id = spawn(capsys)
     wait_terminal(job_id)
     cli.main(["status", job_id])
     out = capsys.readouterr().out
     assert "fake-model-1/medium" in out
-    assert "codex quota: 42%" in out
+    # Usage only shows when explicitly requested.
+    assert "codex usage" not in out
+    cli.main(["status", job_id, "--usage"])
+    out = capsys.readouterr().out
+    assert "codex usage: 42%" in out
     assert "plan: pro" in out
 
 
@@ -1588,26 +1592,26 @@ def test_fancy_status_output(capsys, monkeypatch):
     monkeypatch.setenv("CODEXSPIN_COLOR", "1")
     job_id = spawn(capsys)
     wait_terminal(job_id)
-    cli.main(["status", job_id])
+    cli.main(["status", job_id, "--usage"])
     out = capsys.readouterr().out
     assert "\033[" in out            # ANSI styling active
     assert "✓" in out                # done glyph
-    assert "▓" in out                # quota bar
+    assert "▓" in out                # usage bar
     monkeypatch.setenv("CODEXSPIN_COLOR", "0")
-    cli.main(["status", job_id])
+    cli.main(["status", job_id, "--usage"])
     out = capsys.readouterr().out
     assert "\033[" not in out        # plain when disabled
-    assert "codex quota: 42%" in out
+    assert "codex usage: 42%" in out
 
 
-def test_quota_window_formatting(capsys):
+def test_usage_window_formatting(capsys):
     job_id = spawn(capsys)
     wait_terminal(job_id)
     state_path = jobs.job_dir(job_id) / "state.json"
     state = json.loads(state_path.read_text())
-    state["quota"] = {"used_percent": 12, "window_mins": 300, "plan": "pro", "at": time.time()}
+    state["usage"] = {"used_percent": 12, "window_mins": 300, "plan": "pro", "at": time.time()}
     state_path.write_text(json.dumps(state))
-    cli.main(["status", job_id])
+    cli.main(["status", job_id, "--usage"])
     assert "12% of 5h window" in capsys.readouterr().out
 
 

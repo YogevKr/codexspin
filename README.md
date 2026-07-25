@@ -100,8 +100,9 @@ Job ids accept unambiguous prefixes. Every job records the codex thread id, so
   `CODEXSPIN_HERDR_CLOSE_DELAY`, seconds; negative keeps it open) — the worktree
   itself is untouched. Best-effort: if herdr isn't installed the job runs unchanged.
 - `--max-minutes N` interrupts a runaway job (phase `timeout`).
-- `status` shows each job's resolved model/effort and the latest ChatGPT
-  quota reading (`account/rateLimits/updated` pushed by the app-server).
+- `status` shows each job's resolved model/effort; `status --usage` adds the
+  latest ChatGPT usage reading (`account/rateLimits/updated` pushed by the
+  app-server).
 - Attention is presentation state, separate from the runner-owned execution
   phase: failed/died/timeout jobs are `urgent`, stale live jobs are `quiet`,
   and completed-unseen jobs need `review`. Printing a result via `result`,
