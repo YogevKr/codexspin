@@ -1205,16 +1205,23 @@ def test_dead_runner_detected(capsys, monkeypatch):
 
 
 def test_status_await_and_yolo_spec(capsys):
-    job_a = spawn(capsys, "-n", "alpha")
-    job_b = spawn(capsys, "-n", "beta", "--yolo")
+    job_a = spawn(capsys, "-n", "alpha", "-s", "workspace-write")
+    job_b = spawn(capsys, "-n", "beta")
+    spec_a = json.loads((jobs.job_dir(job_a) / "job.json").read_text())
+    assert spec_a["sandbox"] == "workspace-write"
+    # full access is the default; --yolo remains an explicit alias for it
     spec_b = json.loads((jobs.job_dir(job_b) / "job.json").read_text())
     assert spec_b["sandbox"] == "danger-full-access"
+    job_c = spawn(capsys, "-n", "gamma", "--yolo")
+    spec_c = json.loads((jobs.job_dir(job_c) / "job.json").read_text())
+    assert spec_c["sandbox"] == "danger-full-access"
 
-    rc = cli.main(["await", job_a, job_b, "--timeout", "20"])
+    rc = cli.main(["await", job_a, job_b, job_c, "--timeout", "20"])
     out = capsys.readouterr().out
     assert rc == 0
     assert f"--- {job_a}: done ---" in out
     assert f"--- {job_b}: done ---" in out
+    assert f"--- {job_c}: done ---" in out
     assert jobs.viewed_at(job_a) is not None
     assert jobs.viewed_at(job_b) is not None
 
@@ -1399,7 +1406,8 @@ def test_worktree_job_gets_git_writable_root(capsys, tmp_path, monkeypatch):
     repo = make_repo(tmp_path / "repo")
     argv_file = tmp_path / "codex-argv.json"
     monkeypatch.setenv("FAKE_CODEX_ARGV_FILE", str(argv_file))
-    rc = cli.main(["spawn", "-w", "-C", str(repo), "-n", "gitroot", "do the thing"])
+    rc = cli.main(["spawn", "-w", "-s", "workspace-write", "-C", str(repo),
+                   "-n", "gitroot", "do the thing"])
     assert rc == 0
     job_id = capsys.readouterr().out.strip().splitlines()[-1]
     spec = json.loads((jobs.job_dir(job_id) / "job.json").read_text())
@@ -1422,7 +1430,8 @@ def test_external_worktree_job_gets_git_writable_root(capsys, tmp_path, monkeypa
                     str(ext_wt), "HEAD"], check=True, capture_output=True)
     argv_file = tmp_path / "codex-argv.json"
     monkeypatch.setenv("FAKE_CODEX_ARGV_FILE", str(argv_file))
-    rc = cli.main(["spawn", "-C", str(ext_wt), "-n", "extwt", "do the thing"])
+    rc = cli.main(["spawn", "-s", "workspace-write", "-C", str(ext_wt),
+                   "-n", "extwt", "do the thing"])
     assert rc == 0
     job_id = capsys.readouterr().out.strip().splitlines()[-1]
     spec = json.loads((jobs.job_dir(job_id) / "job.json").read_text())

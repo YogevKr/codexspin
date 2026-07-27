@@ -9,8 +9,9 @@ via the `codex app-server` JSON-RPC API. Replaces the tmux screen-scrape
 Why it exists: OpenAI's [codex-plugin-cc](https://github.com/openai/codex-plugin-cc)
 has the right job model (real state, status, results, resumable threads) but
 caps the sandbox at `workspace-write`. codexspin is the same idea with all
-three sandbox modes, including `danger-full-access` (`--yolo`) for jobs that
-must bind localhost, run dev servers, or fetch the network.
+three sandbox modes, and defaults to `danger-full-access` so jobs can bind
+localhost, run dev servers, and fetch the network; tighten with
+`-s workspace-write` or `-s read-only` when a job shouldn't have that reach.
 
 ## Install
 
@@ -26,9 +27,9 @@ Code transfer command requires the codexspin 0.2.0+ CLI.
 ## Usage
 
 ```sh
-# spawn detached jobs (default sandbox: workspace-write)
+# spawn detached jobs (default sandbox: danger-full-access)
 codexspin spawn -n pagerduty "Implement the PagerDuty integration... "
-codexspin spawn -n e2e --yolo -w "Run the playwright suite and fix failures"
+codexspin spawn -n e2e -w "Run the playwright suite and fix failures"
 codexspin spawn -s read-only "Explain the auth flow in this repo"
 
 # parallel fleet: one worktree per job, no tree conflicts

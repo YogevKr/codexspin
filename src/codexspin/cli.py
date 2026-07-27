@@ -1395,8 +1395,8 @@ def main(argv: list[str] | None = None) -> int:
 
     def add_spawn_args(p):
         p.add_argument("prompt", help="task prompt ('-' reads stdin)")
-        p.add_argument("-s", "--sandbox", choices=SANDBOX_MODES, default="workspace-write")
-        p.add_argument("--yolo", action="store_true", help="shortcut for --sandbox danger-full-access")
+        p.add_argument("-s", "--sandbox", choices=SANDBOX_MODES, default="danger-full-access")
+        p.add_argument("--yolo", action="store_true", help="shortcut for --sandbox danger-full-access (the default)")
         p.add_argument("-m", "--model", default=None)
         p.add_argument("-e", "--effort", default=None,
                        choices=["none", "minimal", "low", "medium", "high", "xhigh"])

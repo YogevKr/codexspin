@@ -155,16 +155,19 @@ or nohup watchdogs. Same prompt discipline and explicit-ask rule apply.
 Verified against codex-cli 0.144 (July 2026).
 
 1. `codexspin spawn -n <name> [-C <repo-root>] "<task>"` — returns a job id
-   immediately (sandbox defaults to workspace-write). Spawn several in one go
+   immediately (sandbox defaults to danger-full-access, so jobs can bind
+   localhost, run dev servers, fetch network, and Codex's own machinery —
+   including its end-of-turn self-review — works). Spawn several in one go
    for parallel work — **always add `-w/--worktree` when spawning more than
    one job on the same repo** (fresh worktree per job, branch
    `codexspin/<job-id>`; the git metadata dir is auto-added to the sandbox's
    writable roots, so the job CAN and SHOULD commit its own work — say so in
    the prompt). Add
    `--max-minutes <n>` on unattended fleets so runaways self-interrupt.
-   `--yolo` for jobs that must bind localhost / run dev servers / fetch
-   network — same controls as the exec bypass below: worktree (`-w` covers
-   it), self-authored prompt, diff review after. `-m/--model -e/--effort`
+   The full-access default carries the same controls as the exec bypass
+   below: worktree (`-w` covers it), self-authored prompt, diff review
+   after — tighten to `-s workspace-write` or `-s read-only` when a prompt
+   embeds text you didn't author. `-m/--model -e/--effort`
    override config defaults; `status` shows the resolved model, and
    `status --usage` the current ChatGPT usage burn — check it before
    spawning a large fleet.
