@@ -97,6 +97,14 @@ spawn→status→await→result ceremony on a single job you're going to watch �
 that friction is what `run` (or plain `codex exec`) exists to avoid. Never
 background a raw `codex exec` with nohup/watchdogs — that pattern is retired.
 
+**Headless has no answer path.** Every branch here runs Codex unattended, so
+nothing can answer a question mid-run. A job that needs one burns to its
+runtime cap and returns `timeout` with partial work — the spend is real and the
+result is not. Delegate here only when the task is settled: goal, constraints,
+and verification all decided. If an open question remains — an ambiguous spec,
+a design call, an approval, unfamiliar code — resolve it before you spawn, or
+run Codex where you can watch the turn and answer it.
+
 1. Slice the task sharp before delegating — goal, constraints, and how to
    verify — using the prompt discipline above. An underspecified task stays
    with you until a fresh agent couldn't misread it.
