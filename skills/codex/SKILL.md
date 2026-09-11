@@ -178,7 +178,10 @@ Verified against codex-cli 0.144 (July 2026).
    embeds text you didn't author. `-m/--model -e/--effort`
    override config defaults; `status` shows the resolved model, and
    `status --usage` the current ChatGPT usage burn — check it before
-   spawning a large fleet.
+   spawning a large fleet. Jobs start through `tcx run` (the TeamCodex
+   account pool) whenever `tcx` is on PATH, so pool quota, not the direct
+   `codex login` account, is what runs out; `codexspin doctor` prints the
+   route and `tcx status` the pool. `CODEXSPIN_TCX=0` forces direct.
 2. `codexspin await <job> [<job>...]` as a background Bash task — a
    busy-waiting shell that blocks until done and prints each result (final
    message, touched files); the task notification wakes you when it exits.

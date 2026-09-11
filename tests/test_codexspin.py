@@ -1949,3 +1949,71 @@ def test_send_wait_blocks_and_prints(capsys):
     assert "FAKE-DONE" in out              # printed the result inline, no separate await
     assert jobs.viewed_at(job_id) is not None
     assert jobs.load_state(job_id)["generation"] == 2
+
+
+# ── TeamCodex (tcx) routing ──────────────────────────────────────────────────
+# `tcx run -- ...` execs codex against the TeamCodex account pool. Jobs go
+# through it whenever tcx is selected, so a single exhausted direct login no
+# longer fails every app-server job while pooled accounts still have quota.
+
+FAKE_TCX = str(Path(__file__).parent / "fake_tcx.py")
+
+
+def test_job_routes_through_tcx_when_selected(capsys, tmp_path, monkeypatch):
+    from codexspin import appserver
+    tcx_argv_file = tmp_path / "tcx-argv.json"
+    codex_argv_file = tmp_path / "codex-argv.json"
+    monkeypatch.setenv("CODEXSPIN_TCX", FAKE_TCX)
+    monkeypatch.setenv("FAKE_TCX_ARGV_FILE", str(tcx_argv_file))
+    monkeypatch.setenv("FAKE_CODEX_ARGV_FILE", str(codex_argv_file))
+    assert appserver.codex_command(["app-server"]) == ([FAKE_TCX, "run", "--", "app-server"], "tcx")
+    job_id = spawn(capsys, "-n", "pooled", "--writable-root", str(tmp_path))
+    state = wait_terminal(job_id)
+    assert state["phase"] == "done"
+    assert state["route"] == "tcx"
+    tcx_argv = json.loads(tcx_argv_file.read_text())
+    assert tcx_argv[:2] == ["run", "--"]
+    assert tcx_argv[-1] == "app-server"
+    # codexspin's own -c overrides survive the trip through tcx, after the
+    # provider settings tcx prepends.
+    codex_argv = json.loads(codex_argv_file.read_text())
+    assert codex_argv[1] == 'model_provider="teamcodex"'
+    assert any(a.startswith("sandbox_workspace_write.writable_roots=") for a in codex_argv)
+    assert codex_argv[-1] == "app-server"
+
+
+def test_tcx_route_can_be_disabled(capsys, tmp_path, monkeypatch):
+    from codexspin import appserver
+    tcx_argv_file = tmp_path / "tcx-argv.json"
+    monkeypatch.setenv("FAKE_TCX_ARGV_FILE", str(tcx_argv_file))
+    monkeypatch.setenv("CODEXSPIN_TCX", "0")
+    monkeypatch.setattr(appserver.shutil, "which", lambda name: FAKE_TCX)
+    assert appserver.codex_command(["app-server"]) == ([FAKE, "app-server"], "direct")
+    job_id = spawn(capsys, "-n", "direct")
+    state = wait_terminal(job_id)
+    assert state["phase"] == "done"
+    assert state["route"] == "direct"
+    assert not tcx_argv_file.exists()
+
+
+def test_tcx_auto_route_follows_path_unless_codex_bin_is_pinned(monkeypatch):
+    from codexspin import appserver
+    monkeypatch.delenv("CODEXSPIN_TCX", raising=False)
+    monkeypatch.setattr(appserver.shutil, "which", lambda name: "/opt/homebrew/bin/tcx")
+    # A pinned codex binary wins: tcx run would exec PATH's codex instead.
+    assert appserver.codex_command(["app-server"]) == ([FAKE, "app-server"], "direct")
+    monkeypatch.delenv("CODEXSPIN_CODEX_BIN")
+    assert appserver.codex_command(["app-server"]) == (
+        ["/opt/homebrew/bin/tcx", "run", "--", "app-server"], "tcx")
+    monkeypatch.setattr(appserver.shutil, "which", lambda name: None)
+    assert appserver.codex_command(["app-server"]) == (["codex", "app-server"], "direct")
+
+
+def test_doctor_reports_codex_route(capsys, monkeypatch):
+    monkeypatch.setenv("CODEXSPIN_TCX", FAKE_TCX)
+    cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert "codex route: tcx run" in out
+    monkeypatch.setenv("CODEXSPIN_TCX", "off")
+    cli.main(["doctor"])
+    assert "codex route: direct" in capsys.readouterr().out

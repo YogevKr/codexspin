@@ -163,9 +163,19 @@ and `rsync`).
 Model/effort default to your `~/.codex/config.toml`; override with
 `-m/--model` and `-e/--effort`.
 
+Jobs run through the [TeamCodex](https://github.com/YogevKr/teamcodex) account
+pool when `tcx` is on PATH: each job's app-server starts as `tcx run -- ...
+app-server`, which points codex at the local proxy (and launches plain codex
+when the proxy is stopped). `codexspin doctor` prints the active route, and
+each job records it as `route` (`tcx` or `direct`) in its state. Set
+`CODEXSPIN_TCX=0` to bypass the pool, or `CODEXSPIN_TCX=/path/to/tcx` to name
+the launcher; a pinned `CODEXSPIN_CODEX_BIN` disables auto-routing because
+`tcx run` execs whatever `codex` is on PATH.
+
 Environment variables: `CODEXSPIN_HOME` (state root, default `~/.codexspin`),
 `CODEXSPIN_CODEX_BIN` (codex binary override — the test suite points it at a
-fake), `CODEXSPIN_SSH_BIN` (ssh transport override, default `ssh`),
+fake), `CODEXSPIN_TCX` (TeamCodex routing: `auto` default, `0` to disable, or
+a tcx path), `CODEXSPIN_SSH_BIN` (ssh transport override, default `ssh`),
 `CODEXSPIN_RSYNC_BIN` (rsync transport override, default `rsync`), and
 `CODEXSPIN_STARTUP_TIMEOUT` (seconds to wait for app-server responses
 during startup, default 180). `CODEXSPIN_EVENTS_MAX_BYTES` controls the active
@@ -233,7 +243,8 @@ uv run pytest
 ```
 
 The suite drives the real runner against a fake app-server
-(`tests/fake_codex.py`, selected via `CODEXSPIN_CODEX_BIN`), covering
+(`tests/fake_codex.py`, selected via `CODEXSPIN_CODEX_BIN`; `tests/fake_tcx.py`
+stands in for `tcx run`), covering
 completion, failure, startup hang, cancel, resume, and dead-runner detection.
 Remote tests use `tests/fake_ssh.py` with a separate `CODEXSPIN_HOME` to model
 another machine.

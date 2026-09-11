@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import threading
 from typing import Any, Callable
@@ -36,15 +37,47 @@ class AppServerError(Exception):
         self.data = data
 
 
+def tcx_bin() -> str | None:
+    """The TeamCodex launcher (`tcx run`) to route codex through, or None.
+
+    `CODEXSPIN_TCX` selects the route: unset/"auto" uses `tcx` from PATH
+    when present, "0"/"off"/"" forces the plain codex binary, anything else
+    names the tcx executable. Auto-routing is skipped while
+    `CODEXSPIN_CODEX_BIN` is set: `tcx run` execs whatever `codex` is on
+    PATH, so it would silently discard that override.
+    """
+    setting = os.environ.get("CODEXSPIN_TCX", "auto")
+    if setting.strip().lower() in ("", "0", "off", "no", "false", "direct"):
+        return None
+    if setting.strip().lower() != "auto":
+        return setting
+    if os.environ.get("CODEXSPIN_CODEX_BIN"):
+        return None
+    return shutil.which("tcx")
+
+
+def codex_command(args: list[str]) -> tuple[list[str], str]:
+    """argv that runs `codex <args>` plus the route name ("tcx" or "direct").
+
+    Through `tcx run` the app-server talks to the TeamCodex account pool
+    (model_provider=teamcodex + proxy token injected by tcx); tcx itself
+    falls back to plain codex when its proxy is stopped.
+    """
+    tcx = tcx_bin()
+    if tcx:
+        return [tcx, "run", "--", *args], "tcx"
+    return [os.environ.get("CODEXSPIN_CODEX_BIN", "codex"), *args], "direct"
+
+
 class AppServerClient:
     """One spawned `codex app-server` process, one client."""
 
     def __init__(self, cwd: str, env: dict[str, str] | None = None,
                  config_overrides: list[str] | None = None):
-        codex_bin = os.environ.get("CODEXSPIN_CODEX_BIN", "codex")
         overrides = [arg for override in (config_overrides or []) for arg in ("-c", override)]
+        argv, self.route = codex_command([*overrides, "app-server"])
         self.proc = subprocess.Popen(
-            [codex_bin, *overrides, "app-server"],
+            argv,
             cwd=cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

@@ -1362,6 +1362,14 @@ def cmd_doctor(args) -> int:
         print(f"⚠ codexspin verified against codex {TESTED_CODEX_MINOR}.x; yours is "
               f"{minor}.x — app-server protocol shapes may have drifted, watch for "
               f"job failures and file an issue if so")
+    from .appserver import tcx_bin
+    tcx = tcx_bin()
+    if tcx:
+        print(f"codex route: tcx run ({tcx}) — TeamCodex account pool, "
+              "plain codex when the proxy is stopped")
+    else:
+        print("codex route: direct (set CODEXSPIN_TCX=<tcx> or install tcx on PATH "
+              "to use the TeamCodex account pool)")
     try:
         client = AppServerClient(cwd=os.getcwd())
         client.initialize()

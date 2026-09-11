@@ -387,6 +387,9 @@ class Runner:
             self.client = AppServerClient(cwd=spec["cwd"], config_overrides=overrides)
             self.client.notification_handler = self.on_notification
             self.client.on_close = self.handle_client_close
+            # "tcx" = codex launched through the TeamCodex account pool;
+            # "direct" = the plain codex binary and its own login.
+            self.set_state(route=self.client.route)
             self.client.initialize()
 
             self.check_aborted()
